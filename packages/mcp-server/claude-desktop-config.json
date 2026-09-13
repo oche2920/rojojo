@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "rojojo": {
+      "command": "node",
+      "args": ["<REPLACE_WITH_ABSOLUTE_PATH_TO>/packages/mcp-server/dist/index.js"],
+      "env": {
+        "ROJOJO_ENV_FILE": "<REPLACE_WITH_ABSOLUTE_PATH_TO_YOUR_ENV_FILE>"
+      }
+    }
+  }
+}

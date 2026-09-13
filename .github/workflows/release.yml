@@ -1,0 +1,67 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+
+concurrency: ${{ github.workflow }}-${{ github.ref }}
+
+# contents: write  — changesets commits the version bump
+# pull-requests: write — changesets opens/updates the release PR
+# issues: write   — the failure watchdog below files an issue
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: pnpm/action-setup@a3252b78c470c02df07e9d59298aecedc3ccdd6d # v3.0.0
+        with:
+          version: 9.15.9
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Create release PR or publish packages
+        id: changesets
+        uses: changesets/action@a45c4d594aa4e2c509dc14a9f2b3b67ba3780d0d # v1.9.0
+        with:
+          publish: pnpm run release
+          version: pnpm run version
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      # Release runs on push, so its result is never part of a PR's check set.
+      # Without this it can fail for weeks unnoticed, which is exactly what
+      # happened before #208. Deduplicated so a run of red pushes files one
+      # issue rather than one per commit.
+      - name: Surface a failed release
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          existing=$(gh issue list --state open --label release --search "Release workflow is failing in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "Still failing on ${GITHUB_SHA:0:8} — $RUN_URL"
+          else
+            body=$(printf '%s\n\n%s\n\n%s\n' \
+              "The Release workflow failed on \`${GITHUB_SHA:0:8}\`." \
+              "$RUN_URL" \
+              "Nothing publishes to npm while this is red, and Changesets cannot update the release PR. This job runs on push, so it is not part of any PR's check set — it will not surface anywhere else.")
+            gh issue create \
+              --title "Release workflow is failing" \
+              --label release \
+              --body "$body"
+          fi

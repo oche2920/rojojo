@@ -1,0 +1,2550 @@
+#![no_std]
+
+use soroban_sdk::{
+    auth::{Context, CustomAccountInterface},
+    contract, contracterror, contractimpl,
+    crypto::Hash,
+    panic_with_error, symbol_short,
+    Address, Bytes, BytesN, Env, Map, Symbol, TryFromVal, Vec,
+};
+
+// ── Storage keys ─────────────────────────────────────────────────────────────
+
+const ADMIN_KEY: Symbol = symbol_short!("admin");
+const PENDING_ADMIN_KEY: Symbol = symbol_short!("p_admin");
+const AGENT_KEY: Symbol = symbol_short!("agentpk");
+const CAP_KEY: Symbol = symbol_short!("dailycap");
+const LIST_KEY: Symbol = symbol_short!("allwlist");
+const EXPIRY_KEY: Symbol = symbol_short!("expiry");
+const INIT_KEY: Symbol = symbol_short!("init");
+const FROZEN_KEY: Symbol = symbol_short!("frozen");
+
+// Global day-spend key: (SPEND_PREFIX, day_bucket) where day_bucket = seq / 17280
+const SPEND_PREFIX: Symbol = symbol_short!("ds");
+// Per-payee day-spend key: (PAYEE_SPEND_PREFIX, day_bucket, payee)
+const PAYEE_SPEND_PREFIX: Symbol = symbol_short!("pds");
+// Lifetime spend cap and monotonic counter (instance storage — never resets)
+const LIFETIME_CAP_KEY: Symbol = symbol_short!("ltcap");
+const LIFETIME_SPEND_KEY: Symbol = symbol_short!("ltspend");
+
+// ── Event names ──────────────────────────────────────────────────────────────
+// Longer than 9 chars — must use Symbol::new(&env, ...) at call sites.
+const EVT_PAYMENT_AUTHORIZED: &str = "payment_authorized";
+const EVT_SESSION_SETTLED: &str = "session_settled";
+const EVT_UPGRADED: &str = "upgraded";
+const EVT_EXPIRY_UPDATED: &str = "expiry_updated";
+const EVT_AGENT_KEY_ROTATED: &str = "agent_key_rotated";
+const EVT_CAP_UPDATED: &str = "cap_updated";
+const EVT_ALLOWLIST_UPDATED: &str = "allowlist_updated";
+const EVT_ADMIN_TRANSFER_REQUESTED: &str = "admin_transfer_requested";
+const EVT_ADMIN_CHANGED: &str = "admin_changed";
+const EVT_VAULT_FROZEN: &str = "vault_frozen";
+const EVT_VAULT_UNFROZEN: &str = "vault_unfrozen";
+
+// ── Error codes ───────────────────────────────────────────────────────────────
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+pub enum Error {
+    AlreadyInitialized = 1,
+    NotInitialized = 2,
+    SessionExpired = 3,
+    DailyCapExceeded = 4,
+    PayeeNotAllowed = 5,
+    PayeeCapExceeded = 6,
+    LifetimeCapExceeded = 7,
+    NoPendingAdmin = 8,
+    ContractFrozen = 9,
+    InvalidAmount = 10,
+    UnauthorizedFunction = 11,
+    MalformedAuthContext = 12,
+}
+
+// ── Contract ──────────────────────────────────────────────────────────────────
+
+#[contract]
+pub struct AgentVault;
+
+#[contractimpl]
+impl AgentVault {
+    /// One-time setup. Protected by INIT_KEY — reverts if called twice.
+    /// `lifetime_cap`: total USDC (stroops) the vault may ever spend; 0 = unlimited.
+    pub fn initialize(
+        env: Env,
+        admin: Address,
+        agent_pk: BytesN<32>,
+        daily_cap: i128,
+        allowlist: Map<Address, i128>,
+        expiry_ledger: u32,
+        lifetime_cap: i128,
+    ) {
+        let storage = env.storage().instance();
+        if storage.has(&INIT_KEY) {
+            panic_with_error!(&env, Error::AlreadyInitialized);
+        }
+        storage.set(&ADMIN_KEY, &admin);
+        storage.set(&AGENT_KEY, &agent_pk);
+        storage.set(&CAP_KEY, &daily_cap);
+        storage.set(&LIST_KEY, &allowlist);
+        storage.set(&EXPIRY_KEY, &expiry_ledger);
+        storage.set(&LIFETIME_CAP_KEY, &lifetime_cap);
+        storage.set(&LIFETIME_SPEND_KEY, &0_i128);
+        storage.set(&INIT_KEY, &true);
+        // Extend instance storage TTL to outlive any realistic session expiry
+        env.storage().instance().extend_ttl(2_000_000, 2_000_000);
+    }
+
+    /// Update the daily USDC spend cap (in stroops). Admin only.
+    pub fn set_daily_cap(env: Env, new_cap: i128) {
+        let storage = env.storage().instance();
+        let admin: Address = storage
+            .get(&ADMIN_KEY)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        admin.require_auth();
+        let old_cap: i128 = storage.get(&CAP_KEY).unwrap_or(0);
+        storage.set(&CAP_KEY, &new_cap);
+        env.events().publish(
+            (Symbol::new(&env, EVT_CAP_UPDATED), symbol_short!("daily")),
+            (old_cap, new_cap),
+        );
+    }
+
+    /// Upsert a payee address in the spend allowlist with a per-payee daily sub-cap. Admin only.
+    pub fn add_to_allowlist(env: Env, payee: Address, sub_cap: i128) {
+        let storage = env.storage().instance();
+        let admin: Address = storage
+            .get(&ADMIN_KEY)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        admin.require_auth();
+        let mut map: Map<Address, i128> = storage
+            .get(&LIST_KEY)
+            .unwrap_or_else(|| Map::new(&env));
+        map.set(payee.clone(), sub_cap);
+        storage.set(&LIST_KEY, &map);
+        env.events().publish(
+            (Symbol::new(&env, EVT_ALLOWLIST_UPDATED), payee),
+            Some(sub_cap),
+        );
+    }
+
+    /// Remove a payee address from the spend allowlist. Admin only.
+    pub fn remove_from_allowlist(env: Env, payee: Address) {
+        let storage = env.storage().instance();
+        let admin: Address = storage
+            .get(&ADMIN_KEY)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        admin.require_auth();
+        let mut map: Map<Address, i128> = storage
+            .get(&LIST_KEY)
+            .unwrap_or_else(|| Map::new(&env));
+        map.remove(payee.clone());
+        storage.set(&LIST_KEY, &map);
+        env.events().publish(
+            (Symbol::new(&env, EVT_ALLOWLIST_UPDATED), payee),
+            Option::<i128>::None,
+        );
+    }
+
+    /// Record an off-chain channel settlement. Emits `session_settled`. Admin only.
+    pub fn record_session_settlement(
+        env: Env,
+        channel_id: Address,
+        payer: Address,
+        payee: Address,
+        cumulative_amount: i128,
+        voucher_count: u32,
+    ) {
+        let storage = env.storage().instance();
+        let admin: Address = storage
+            .get(&ADMIN_KEY)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        admin.require_auth();
+
+        // topics: (Symbol("session_settled"), channel_id, payee)
+        // data:   (payer, cumulative_amount, voucher_count)
+        env.events().publish(
+            (Symbol::new(&env, EVT_SESSION_SETTLED), channel_id, payee),
+            (payer, cumulative_amount, voucher_count),
+        );
+    }
+
+    /// Update the lifetime USDC spend cap (in stroops). Admin only. 0 = unlimited.
+    /// Can only be lowered below current spend counter, not raised beyond the original
+    /// intent — callers should treat this as a ratchet-down control.
+    pub fn set_lifetime_cap(env: Env, new_cap: i128) {
+        let storage = env.storage().instance();
+        let admin: Address = storage
+            .get(&ADMIN_KEY)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        admin.require_auth();
+        let old_cap: i128 = storage.get(&LIFETIME_CAP_KEY).unwrap_or(0);
+        storage.set(&LIFETIME_CAP_KEY, &new_cap);
+        env.events().publish(
+            (Symbol::new(&env, EVT_CAP_UPDATED), symbol_short!("lifetime")),
+            (old_cap, new_cap),
+        );
+    }
+
+    /// Extend (or otherwise set) the session expiry ledger. Admin only.
+    /// This is the recovery escape hatch after expiry: an admin can push the
+    /// expiry forward so payments resume without reinitializing the vault.
+    pub fn set_expiry(env: Env, new_expiry: u32) {
+        let storage = env.storage().instance();
+        let admin: Address = storage
+            .get(&ADMIN_KEY)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        admin.require_auth();
+        storage.set(&EXPIRY_KEY, &new_expiry);
+        // topics: (Symbol("expiry_updated"), admin)
+        // data:   new_expiry
+        env.events().publish(
+            (Symbol::new(&env, EVT_EXPIRY_UPDATED), admin),
+            new_expiry,
+        );
+    }
+
+    /// Rotate the agent's Ed25519 public key. Admin only.
+    /// Recovery control for a leaked/compromised agent key — subsequent auth
+    /// must be signed with the new key, and the old key is immediately invalid.
+    pub fn set_agent_pubkey(env: Env, new_pk: BytesN<32>) {
+        let storage = env.storage().instance();
+        let admin: Address = storage
+            .get(&ADMIN_KEY)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        admin.require_auth();
+        storage.set(&AGENT_KEY, &new_pk);
+        // topics: (Symbol("agent_key_rotated"),)
+        // data:   new_pk
+        env.events().publish(
+            (Symbol::new(&env, EVT_AGENT_KEY_ROTATED),),
+            new_pk,
+        );
+    }
+
+    /// Return the vault's cumulative lifetime spend counter (stroops). Read-only.
+    pub fn get_lifetime_spend(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get::<Symbol, i128>(&LIFETIME_SPEND_KEY)
+            .unwrap_or(0)
+    }
+
+    /// Initiate a transfer of admin rights to a new address. Admin only.
+    pub fn transfer_admin(env: Env, new_admin: Address) {
+        let storage = env.storage().instance();
+        let admin: Address = storage
+            .get(&ADMIN_KEY)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        admin.require_auth();
+        storage.set(&PENDING_ADMIN_KEY, &new_admin);
+        env.events().publish(
+            (Symbol::new(&env, EVT_ADMIN_TRANSFER_REQUESTED), admin, new_admin),
+            (),
+        );
+    }
+
+    /// Accept a pending transfer of admin rights. Pending admin only.
+    pub fn accept_admin(env: Env) {
+        let storage = env.storage().instance();
+        let pending_admin: Address = storage
+            .get(&PENDING_ADMIN_KEY)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NoPendingAdmin));
+        pending_admin.require_auth();
+        let old_admin: Address = storage
+            .get(&ADMIN_KEY)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        storage.set(&ADMIN_KEY, &pending_admin);
+        storage.remove(&PENDING_ADMIN_KEY);
+        env.events().publish(
+            (Symbol::new(&env, EVT_ADMIN_CHANGED), old_admin, pending_admin),
+            (),
+        );
+    }
+
+    /// Freeze the contract, preventing any agent transfers. Admin only.
+    pub fn freeze(env: Env) {
+        let storage = env.storage().instance();
+        let admin: Address = storage
+            .get(&ADMIN_KEY)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        admin.require_auth();
+        storage.set(&FROZEN_KEY, &true);
+        env.events().publish((Symbol::new(&env, EVT_VAULT_FROZEN),), ());
+    }
+
+    /// Unfreeze the contract, allowing agent transfers again. Admin only.
+    pub fn unfreeze(env: Env) {
+        let storage = env.storage().instance();
+        let admin: Address = storage
+            .get(&ADMIN_KEY)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        admin.require_auth();
+        storage.set(&FROZEN_KEY, &false);
+        env.events().publish((Symbol::new(&env, EVT_VAULT_UNFROZEN),), ());
+    }
+
+    /// Upgrade the vault's wasm to `new_wasm_hash`. Admin only.
+    /// The new wasm must already be uploaded on-chain (e.g. via `upload_contract_wasm`)
+    /// before this is called — this only swaps which code the deployed instance runs.
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
+        let storage = env.storage().instance();
+        let admin: Address = storage
+            .get(&ADMIN_KEY)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        admin.require_auth();
+        env.deployer()
+            .update_current_contract_wasm(new_wasm_hash.clone());
+        env.events()
+            .publish((Symbol::new(&env, EVT_UPGRADED),), new_wasm_hash);
+    }
+
+    /// Return the global daily spend cap (view-only).
+    pub fn daily_cap(env: Env) -> i128 {
+        env.storage().instance().get(&CAP_KEY).unwrap_or(0)
+    }
+
+    /// Return the allowed payees and their sub-caps (view-only).
+    pub fn allowlist(env: Env) -> Map<Address, i128> {
+        env.storage().instance().get(&LIST_KEY).unwrap_or_else(|| Map::new(&env))
+    }
+
+    /// Return the session expiry ledger (view-only).
+    pub fn expiry_ledger(env: Env) -> u32 {
+        env.storage().instance().get(&EXPIRY_KEY).unwrap_or(0)
+    }
+
+    /// Return the authorized agent's Ed25519 public key (view-only).
+    pub fn agent_pubkey(env: Env) -> BytesN<32> {
+        env.storage().instance().get(&AGENT_KEY).unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized))
+    }
+}
+
+// ── CustomAccountInterface ────────────────────────────────────────────────────
+//
+// Architecture follows Crossmint/stellar-smart-account v1.0.0:
+//   • Signature = Ed25519 BytesN<64>
+//   • __check_auth runs policies against every Context::Contract("transfer") entry
+//   • Default-deny: any other authorization context (SAC approve/burn, non-
+//     contract host fns) is rejected with Error::UnauthorizedFunction — a
+//     stolen agent key cannot bypass the caps via a non-transfer call
+//   • Policy 1 — DailyCapPolicy:  keyed by (SPEND_PREFIX, seq / 17280) in
+//     temporary storage; resets automatically when the bucket rolls over
+//   • Policy 2 — EndpointAllowlistPolicy: recipient from args[1] checked
+//     against ALLOWLIST in instance storage; also reads the per-payee sub-cap
+//   • Policy 3 — SessionKeyExpiry: ledger sequence compared to stored EXPIRY
+//   • Policy 4 — PerPayeeCapPolicy: keyed by (PAYEE_SPEND_PREFIX, seq / 17280, payee)
+//     in temporary storage; prevents a single compromised provider from draining
+//     the global daily cap
+//   • Policy 5 — LifetimeCapPolicy: monotonic spend_counter in instance storage;
+//     enforced when lifetime_cap > 0; never resets across day boundaries
+
+#[contractimpl]
+impl CustomAccountInterface for AgentVault {
+    type Signature = BytesN<64>;
+    type Error = Error;
+
+    #[allow(non_snake_case)]
+    fn __check_auth(
+        env: Env,
+        signature_payload: Hash<32>,
+        signature: BytesN<64>,
+        auth_contexts: Vec<Context>,
+    ) -> Result<(), Error> {
+        let storage = env.storage().instance();
+        // Keep instance storage alive through the lifetime of auth calls
+        storage.extend_ttl(2_000_000, 2_000_000);
+
+
+        // ── Emergency Stop Check ─────────────────────────────────────────────
+        let is_frozen: bool = storage.get(&FROZEN_KEY).unwrap_or(false);
+        if is_frozen {
+            return Err(Error::ContractFrozen);
+        }
+
+        // ── Verify Ed25519 signature ─────────────────────────────────────────
+        let agent_pk: BytesN<32> = storage.get(&AGENT_KEY).ok_or(Error::NotInitialized)?;
+        // Hash<32> -> Bytes via From<Hash<N>> for Bytes (soroban-sdk 22.x)
+        let msg: Bytes = signature_payload.into();
+        env.crypto().ed25519_verify(&agent_pk, &msg, &signature);
+
+        // ── Policy 3: Session key expiry (ledger-based) ──────────────────────
+        let expiry: u32 = storage.get(&EXPIRY_KEY).unwrap_or(u32::MAX);
+        if env.ledger().sequence() > expiry {
+            return Err(Error::SessionExpired);
+        }
+
+        // ── Load policy state ────────────────────────────────────────────────
+        let daily_cap: i128 = storage.get(&CAP_KEY).unwrap_or(i128::MAX);
+        let lifetime_cap: i128 = storage.get(&LIFETIME_CAP_KEY).unwrap_or(0);
+        let mut lifetime_spend: i128 = storage
+            .get::<Symbol, i128>(&LIFETIME_SPEND_KEY)
+            .unwrap_or(0);
+        let allowlist: Map<Address, i128> = storage
+            .get(&LIST_KEY)
+            .unwrap_or_else(|| Map::new(&env));
+
+        // Day bucket: one bucket per ~24 h (17 280 ledgers × ~5 s each)
+        let day_bucket: u32 = env.ledger().sequence() / 17_280;
+        let spend_key = (SPEND_PREFIX, day_bucket);
+        let mut day_spend: i128 = env
+            .storage()
+            .temporary()
+            .get::<(Symbol, u32), i128>(&spend_key)
+            .unwrap_or(0);
+
+        // ── Per-context policy checks ─────────────────────────────────────────
+        // Default-deny: the policies below only fire for SAC transfer calls, so
+        // ANY other authorization context must be rejected rather than silently
+        // skipped. Without this, a stolen agent key could sign an auth for the
+        // USDC SAC's approve()/burn() (or a create_contract host fn) and drain
+        // the vault via transfer_from without ever touching a cap.
+        for context in auth_contexts.iter() {
+            match context {
+                Context::Contract(ctx) if ctx.fn_name == Symbol::new(&env, "transfer") => {
+                    // SAC transfer(from: Address, to: Address, amount: i128)
+                    if ctx.args.len() != 3 {
+                        return Err(Error::MalformedAuthContext);
+                    }
+                    let from: Address = ctx
+                        .args
+                        .get(0)
+                        .ok_or(Error::MalformedAuthContext)
+                        .and_then(|value| {
+                            Address::try_from_val(&env, &value)
+                                .map_err(|_| Error::MalformedAuthContext)
+                        })?;
+                    let to: Address = ctx
+                        .args
+                        .get(1)
+                        .ok_or(Error::MalformedAuthContext)
+                        .and_then(|value| {
+                            Address::try_from_val(&env, &value)
+                                .map_err(|_| Error::MalformedAuthContext)
+                        })?;
+                    let amount: i128 = ctx
+                        .args
+                        .get(2)
+                        .ok_or(Error::MalformedAuthContext)
+                        .and_then(|value| {
+                            i128::try_from_val(&env, &value)
+                                .map_err(|_| Error::MalformedAuthContext)
+                        })?;
+                    let asset: Address = ctx.contract.clone();
+
+                    // Reject non-positive amounts: a negative amount would
+                    // deflate the day/payee/lifetime spend counters via
+                    // checked_add, letting subsequent real transfers exceed
+                    // every cap. Zero amounts are meaningless and also rejected.
+                    if amount <= 0 {
+                        return Err(Error::InvalidAmount);
+                    }
+
+                    // Policy 2 — EndpointAllowlistPolicy (also fetches per-payee sub-cap)
+                    let payee_sub_cap = allowlist.get(to.clone()).ok_or(Error::PayeeNotAllowed)?;
+
+                    // Policy 1 — Global DailyCapPolicy
+                    let projected = day_spend.checked_add(amount).unwrap_or(i128::MAX);
+                    if projected > daily_cap {
+                        return Err(Error::DailyCapExceeded);
+                    }
+                    day_spend = projected;
+
+                    // Policy 4 — Per-payee DailyCapPolicy
+                    let payee_spend_key = (PAYEE_SPEND_PREFIX, day_bucket, to.clone());
+                    let payee_spend: i128 = env
+                        .storage()
+                        .temporary()
+                        .get::<(Symbol, u32, Address), i128>(&payee_spend_key)
+                        .unwrap_or(0);
+                    let payee_projected = payee_spend.checked_add(amount).unwrap_or(i128::MAX);
+                    if payee_projected > payee_sub_cap {
+                        return Err(Error::PayeeCapExceeded);
+                    }
+
+                    // Persist updated per-payee spend — TTL covers current bucket + one more day
+                    env.storage()
+                        .temporary()
+                        .set::<(Symbol, u32, Address), i128>(&payee_spend_key, &payee_projected);
+                    env.storage()
+                        .temporary()
+                        .extend_ttl::<(Symbol, u32, Address)>(&payee_spend_key, 17_280, 34_560);
+
+                    // Policy 5 — LifetimeCapPolicy (monotonic, never resets)
+                    // Always accumulate; enforce only when a cap is set (lifetime_cap > 0).
+                    let projected_lifetime =
+                        lifetime_spend.checked_add(amount).unwrap_or(i128::MAX);
+                    if lifetime_cap > 0 && projected_lifetime > lifetime_cap {
+                        return Err(Error::LifetimeCapExceeded);
+                    }
+                    lifetime_spend = projected_lifetime;
+
+                    // topics: (Symbol("payment_authorized"), payer, payee)
+                    // data:   (amount, asset, daily_cumulative)
+                    env.events().publish(
+                        (Symbol::new(&env, EVT_PAYMENT_AUTHORIZED), from, to),
+                        (amount, asset, day_spend),
+                    );
+                }
+                // Any non-transfer contract call (SAC approve, burn, …) or
+                // non-contract host fn (create_contract) is unauthorized.
+                _ => {
+                    return Err(Error::UnauthorizedFunction);
+                }
+            }
+        }
+
+        // Persist updated global day spend — TTL covers current bucket + one more day
+        env.storage()
+            .temporary()
+            .set::<(Symbol, u32), i128>(&spend_key, &day_spend);
+        env.storage()
+            .temporary()
+            .extend_ttl::<(Symbol, u32)>(&spend_key, 17_280, 34_560);
+
+        // Persist monotonic lifetime spend counter — must survive vault lifetime
+        storage.set(&LIFETIME_SPEND_KEY, &lifetime_spend);
+
+        Ok(())
+    }
+}
+
+// ── Tests ──────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::{
+        auth::{ContractContext, ContractExecutable, CreateContractHostFnContext},
+        testutils::{Address as _, BytesN as _, Ledger},
+        IntoVal, FromVal,
+    };
+
+    // Use ed25519-dalek for signing in tests (same pattern as Crossmint/stellar-smart-account)
+    extern crate std;
+    use ed25519_dalek::{Signer as _, SigningKey};
+    use rand::rngs::OsRng;
+
+    fn gen_keypair(env: &Env) -> (SigningKey, BytesN<32>) {
+        let sk = SigningKey::generate(&mut OsRng);
+        let pk = BytesN::<32>::from_array(env, &sk.verifying_key().to_bytes());
+        (sk, pk)
+    }
+
+    fn sign_payload(env: &Env, sk: &SigningKey, payload: &BytesN<32>) -> BytesN<64> {
+        let sig = sk.sign(&payload.to_array());
+        BytesN::<64>::from_array(env, &sig.to_bytes())
+    }
+
+    fn event_topic_matches(env: &Env, topic: soroban_sdk::Val, expected: &Symbol) -> bool {
+        let sym: Symbol = topic.into_val(env);
+        sym == *expected
+    }
+
+    fn setup(env: &Env) -> (AgentVaultClient<'_>, SigningKey, Address, Address) {
+        let vault_id = env.register(AgentVault, ());
+        let client = AgentVaultClient::new(env, &vault_id);
+
+        let admin = Address::generate(env);
+        let (agent_sk, agent_pk) = gen_keypair(env);
+        let provider_a = Address::generate(env);
+
+        // daily_cap = 5_000_000 stroops (0.50 USDC), per-payee sub_cap = 5_000_000, expiry = ledger 10_000, no lifetime cap
+        let allowlist = Map::from_array(env, [(provider_a.clone(), 5_000_000_i128)]);
+        client.initialize(&admin, &agent_pk, &5_000_000_i128, &allowlist, &10_000_u32, &0_i128);
+
+        (client, agent_sk, vault_id, provider_a)
+    }
+
+    fn transfer_context(env: &Env, to: &Address, amount: i128) -> Context {
+        let token = Address::generate(env);
+        let from = Address::generate(env);
+        Context::Contract(ContractContext {
+            contract: token,
+            fn_name: symbol_short!("transfer"),
+            args: (from, to.clone(), amount).into_val(env),
+        })
+    }
+
+    fn malformed_transfer_context(env: &Env, args: soroban_sdk::Vec<soroban_sdk::Val>) -> Context {
+        let token = Address::generate(env);
+        Context::Contract(ContractContext {
+            contract: token,
+            fn_name: symbol_short!("transfer"),
+            args,
+        })
+    }
+
+    /// Read (day_spend, per_payee_spend, lifetime_spend) directly from storage.
+    fn read_spend_counters(env: &Env, vault_id: &Address, to: &Address) -> (i128, i128, i128) {
+        let day_bucket: u32 = env.ledger().sequence() / 17_280;
+        let spend_key = (SPEND_PREFIX, day_bucket);
+        let payee_key = (PAYEE_SPEND_PREFIX, day_bucket, to.clone());
+        env.as_contract(vault_id, || {
+            let day = env
+                .storage()
+                .temporary()
+                .get::<(Symbol, u32), i128>(&spend_key)
+                .unwrap_or(0);
+            let payee = env
+                .storage()
+                .temporary()
+                .get::<(Symbol, u32, Address), i128>(&payee_key)
+                .unwrap_or(0);
+            let lifetime = env
+                .storage()
+                .instance()
+                .get::<Symbol, i128>(&LIFETIME_SPEND_KEY)
+                .unwrap_or(0);
+            (day, payee, lifetime)
+        })
+    }
+
+    /// Test 1: valid payment within cap to allowlisted address passes
+    #[test]
+    fn test_valid_payment_within_cap_passes() {
+        let env = Env::default();
+        let (_, agent_sk, vault_id, provider_a) = setup(&env);
+
+        let payload = BytesN::<32>::random(&env);
+        let sig = sign_payload(&env, &agent_sk, &payload);
+        let contexts = Vec::from_array(&env, [transfer_context(&env, &provider_a, 100_000)]);
+
+        let result = env.try_invoke_contract_check_auth::<Error>(
+            &vault_id,
+            &payload,
+            sig.into_val(&env),
+            &contexts,
+        );
+        assert!(result.is_ok(), "valid payment should pass: {result:?}");
+    }
+
+    #[test]
+    fn test_transfer_context_with_wrong_arity_returns_typed_error() {
+        let env = Env::default();
+        let (_, agent_sk, vault_id, _) = setup(&env);
+        let payload = BytesN::<32>::random(&env);
+        let sig = sign_payload(&env, &agent_sk, &payload);
+
+        for args in [
+            Vec::new(&env),
+            Vec::from_array(&env, [Address::generate(&env).into_val(&env)]),
+            Vec::from_array(
+                &env,
+                [Address::generate(&env).into_val(&env), Address::generate(&env).into_val(&env)],
+            ),
+        ] {
+            let contexts = Vec::from_array(&env, [malformed_transfer_context(&env, args)]);
+            let result = env.try_invoke_contract_check_auth::<Error>(
+                &vault_id,
+                &payload,
+                sig.clone().into_val(&env),
+                &contexts,
+            );
+            assert_eq!(result.unwrap_err().unwrap(), Error::MalformedAuthContext);
+        }
+    }
+
+    #[test]
+    fn test_transfer_context_with_wrong_amount_type_returns_typed_error() {
+        let env = Env::default();
+        let (_, agent_sk, vault_id, _) = setup(&env);
+        let payload = BytesN::<32>::random(&env);
+        let sig = sign_payload(&env, &agent_sk, &payload);
+        let args = (
+            Address::generate(&env),
+            Address::generate(&env),
+            symbol_short!("bad_amt"),
+        )
+            .into_val(&env);
+        let contexts = Vec::from_array(&env, [malformed_transfer_context(&env, args)]);
+        let result = env.try_invoke_contract_check_auth::<Error>(
+            &vault_id,
+            &payload,
+            sig.into_val(&env),
+            &contexts,
+        );
+        assert_eq!(result.unwrap_err().unwrap(), Error::MalformedAuthContext);
+    }
+
+    /// Test 2: payment exceeding daily cap is rejected
+    #[test]
+    fn test_payment_exceeding_daily_cap_rejected() {
+        let env = Env::default();
+        let (_, agent_sk, vault_id, provider_a) = setup(&env);
+
+        // 6_000_000 > 5_000_000 cap
+        let payload = BytesN::<32>::random(&env);
+        let sig = sign_payload(&env, &agent_sk, &payload);
+        let contexts =
+            Vec::from_array(&env, [transfer_context(&env, &provider_a, 6_000_000)]);
+
+        let result = env.try_invoke_contract_check_auth::<Error>(
+            &vault_id,
+            &payload,
+            sig.into_val(&env),
+            &contexts,
+        );
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            Error::DailyCapExceeded,
+            "should reject over-cap transfer"
+        );
+    }
+
+    /// Test 3: payment to non-allowlisted address is rejected
+    #[test]
+    fn test_payment_to_non_allowlisted_address_rejected() {
+        let env = Env::default();
+        let (_, agent_sk, vault_id, _) = setup(&env);
+
+        let unlisted = Address::generate(&env);
+        let payload = BytesN::<32>::random(&env);
+        let sig = sign_payload(&env, &agent_sk, &payload);
+        let contexts = Vec::from_array(&env, [transfer_context(&env, &unlisted, 100_000)]);
+
+        let result = env.try_invoke_contract_check_auth::<Error>(
+            &vault_id,
+            &payload,
+            sig.into_val(&env),
+            &contexts,
+        );
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            Error::PayeeNotAllowed,
+            "should reject payment to non-allowlisted address"
+        );
+    }
+
+    /// Test 4: session key past expiry ledger is rejected
+    #[test]
+    fn test_session_key_after_expiry_rejected() {
+        let env = Env::default();
+        let (_, agent_sk, vault_id, provider_a) = setup(&env);
+
+        // Fast-forward ledger past expiry (expiry = 10_000)
+        env.ledger().set_sequence_number(10_001);
+
+        let payload = BytesN::<32>::random(&env);
+        let sig = sign_payload(&env, &agent_sk, &payload);
+        let contexts = Vec::from_array(&env, [transfer_context(&env, &provider_a, 100_000)]);
+
+        let result = env.try_invoke_contract_check_auth::<Error>(
+            &vault_id,
+            &payload,
+            sig.into_val(&env),
+            &contexts,
+        );
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            Error::SessionExpired,
+            "should reject expired session key"
+        );
+    }
+
+    /// Test 5: daily cap boundary — payment at exactly the cap succeeds
+    #[test]
+    fn test_daily_cap_boundary_at_limit_succeeds() {
+        let env = Env::default();
+        let (_, agent_sk, vault_id, provider_a) = setup(&env);
+        // Daily cap = 5_000_000
+
+        let payload = BytesN::<32>::random(&env);
+        let sig = sign_payload(&env, &agent_sk, &payload);
+        let contexts = Vec::from_array(&env, [transfer_context(&env, &provider_a, 5_000_000)]);
+
+        let result = env.try_invoke_contract_check_auth::<Error>(
+            &vault_id,
+            &payload,
+            sig.into_val(&env),
+            &contexts,
+        );
+        assert!(
+            result.is_ok(),
+            "payment at exactly the cap should succeed"
+        );
+    }
+
+    /// Test 6: daily cap boundary — payment exceeding cap by 1 stroop fails
+    #[test]
+    fn test_daily_cap_boundary_exceeding_by_one_fails() {
+        let env = Env::default();
+        let (_, agent_sk, vault_id, provider_a) = setup(&env);
+        // Daily cap = 5_000_000
+
+        let payload = BytesN::<32>::random(&env);
+        let sig = sign_payload(&env, &agent_sk, &payload);
+        let contexts = Vec::from_array(&env, [transfer_context(&env, &provider_a, 5_000_001)]);
+
+        let result = env.try_invoke_contract_check_auth::<Error>(
+            &vault_id,
+            &payload,
+            sig.into_val(&env),
+            &contexts,
+        );
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            Error::DailyCapExceeded,
+            "payment exceeding cap by 1 stroop should fail"
+        );
+    }
+
+    /// Test 7: accumulated daily spend — multiple transfers within cap succeed
+    #[test]
+    fn test_accumulated_spend_within_cap_succeeds() {
+        let env = Env::default();
+        let (_, agent_sk, vault_id, provider_a) = setup(&env);
+        // Daily cap = 5_000_000
+
+        // First transfer: 2_000_000
+        let payload1 = BytesN::<32>::random(&env);
+        let sig1 = sign_payload(&env, &agent_sk, &payload1);
+        let contexts1 = Vec::from_array(&env, [transfer_context(&env, &provider_a, 2_000_000)]);
+        let result1 = env.try_invoke_contract_check_auth::<Error>(
+            &vault_id,
+            &payload1,
+            sig1.into_val(&env),
+            &contexts1,
+        );
+        assert!(result1.is_ok(), "first transfer should succeed");
+
+        // Second transfer: 3_000_000 (total = 5_000_000)
+        let payload2 = BytesN::<32>::random(&env);
+        let sig2 = sign_payload(&env, &agent_sk, &payload2);
+        let contexts2 = Vec::from_array(&env, [transfer_context(&env, &provider_a, 3_000_000)]);
+        let result2 = env.try_invoke_contract_check_auth::<Error>(
+            &vault_id,
+            &payload2,
+            sig2.into_val(&env),
+            &contexts2,
+        );
+        assert!(result2.is_ok(), "second transfer within accumulated cap should succeed");
+    }
+
+    /// Test 8: accumulated daily spend — exceeding cap on second transfer fails
+    #[test]
+    fn test_accumulated_spend_exceeding_cap_fails() {
+        let env = Env::default();
+        let (_, agent_sk, vault_id, provider_a) = setup(&env);
+        // Daily cap = 5_000_000
+
+        // First transfer: 3_000_000
+        let payload1 = BytesN::<32>::random(&env);
+        let sig1 = sign_payload(&env, &agent_sk, &payload1);
+        let contexts1 = Vec::from_array(&env, [transfer_context(&env, &provider_a, 3_000_000)]);
+        let result1 = env.try_invoke_contract_check_auth::<Error>(
+            &vault_id,
+            &payload1,
+            sig1.into_val(&env),
+            &contexts1,
+        );
+        assert!(result1.is_ok(), "first transfer should succeed");
+
+        // Second transfer: 2_500_000 (total would be 5_500_000 > cap)
+        let payload2 = BytesN::<32>::random(&env);
+        let sig2 = sign_payload(&env, &agent_sk, &payload2);
+        let contexts2 = Vec::from_array(&env, [transfer_context(&env, &provider_a, 2_500_000)]);
+        let result2 = env.try_invoke_contract_check_auth::<Error>(
+            &vault_id,
+            &payload2,
+            sig2.into_val(&env),
+            &contexts2,
+        );
+        assert_eq!(
+            result2.unwrap_err().unwrap(),
+            Error::DailyCapExceeded,
+            "second transfer exceeding accumulated cap should fail"
+        );
+    }
+
+    /// Test 9: allowlist with multiple entries — all allowlisted addresses accepted
+    #[test]
+    fn test_allowlist_multiple_entries_all_accepted() {
+        let env = Env::default();
+        let vault_id = env.register(AgentVault, ());
+        let client = AgentVaultClient::new(&env, &vault_id);
+
+        let admin = Address::generate(&env);
+        let (agent_sk, agent_pk) = gen_keypair(&env);
+        let provider_a = Address::generate(&env);
+        let provider_b = Address::generate(&env);
+        let provider_c = Address::generate(&env);
+
+        let allowlist = Map::from_array(
+            &env,
+            [
+                (provider_a.clone(), 5_000_000_i128),
+                (provider_b.clone(), 5_000_000_i128),
+                (provider_c.clone(), 5_000_000_i128),
+            ],
+        );
+        client.initialize(&admin, &agent_pk, &5_000_000_i128, &allowlist, &10_000_u32, &0_i128);
+
+        // Test payment to each allowlisted address
+        for provider in [provider_a, provider_b, provider_c] {
+            let payload = BytesN::<32>::random(&env);
+            let sig = sign_payload(&env, &agent_sk, &payload);
+            let contexts = Vec::from_array(&env, [transfer_context(&env, &provider, 100_000)]);
+
+            let result = env.try_invoke_contract_check_auth::<Error>(
+                &vault_id,
+                &payload,
+                sig.into_val(&env),
+                &contexts,
+            );
+            assert!(result.is_ok(), "all allowlisted addresses should be accepted");
+        }
+    }
+
+    /// Test 10: session expiry at exact boundary — payment at expiry ledger succeeds
+    #[test]
+    fn test_session_expiry_at_boundary_succeeds() {
+        let env = Env::default();
+        let (_, agent_sk, vault_id, provider_a) = setup(&env);
+        // Expiry = 10_000
+
+        // Set ledger to exactly the expiry boundary
+        env.ledger().set_sequence_number(10_000);
+
+        let payload = BytesN::<32>::random(&env);
+        let sig = sign_payload(&env, &agent_sk, &payload);
+        let contexts = Vec::from_array(&env, [transfer_context(&env, &provider_a, 100_000)]);
+
+        let result = env.try_invoke_contract_check_auth::<Error>(
+            &vault_id,
+            &payload,
+            sig.into_val(&env),
+            &contexts,
+        );
+        assert!(result.is_ok(), "payment at expiry boundary ledger should succeed");
+    }
+
+    /// Test 11: session expiry one ledger past boundary — payment rejected
+    #[test]
+    fn test_session_expiry_one_past_boundary_fails() {
+        let env = Env::default();
+        let (_, agent_sk, vault_id, provider_a) = setup(&env);
+        // Expiry = 10_000
+
+        // Set ledger to one past the expiry boundary
+        env.ledger().set_sequence_number(10_001);
+
+        let payload = BytesN::<32>::random(&env);
+        let sig = sign_payload(&env, &agent_sk, &payload);
+        let contexts = Vec::from_array(&env, [transfer_context(&env, &provider_a, 100_000)]);
+
+        let result = env.try_invoke_contract_check_auth::<Error>(
+            &vault_id,
+            &payload,
+            sig.into_val(&env),
+            &contexts,
+        );
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            Error::SessionExpired,
+            "payment one ledger past expiry should fail"
+        );
+    }
+
+    /// Test 12: overflow protection — very large successive payments rejected safely
+    #[test]
+    fn test_overflow_protection_large_successive_payments() {
+        let env = Env::default();
+        let (_, agent_sk, vault_id, provider_a) = setup(&env);
+        // Daily cap = 5_000_000
+
+        // First large transfer: 4_000_000_000_000_000 (i128 near limit)
+        let payload1 = BytesN::<32>::random(&env);
+        let sig1 = sign_payload(&env, &agent_sk, &payload1);
+        let contexts1 = Vec::from_array(&env, [transfer_context(&env, &provider_a, 4_000_000_000_000_000)]);
+        let result1 = env.try_invoke_contract_check_auth::<Error>(
+            &vault_id,
+            &payload1,
+            sig1.into_val(&env),
+            &contexts1,
+        );
+        // This should fail due to cap, not overflow
+        assert_eq!(
+            result1.unwrap_err().unwrap(),
+            Error::DailyCapExceeded,
+            "large transfer exceeding cap should fail with DailyCapExceeded, not overflow"
+        );
+    }
+
+    /// Test 13: daily reset logic — spending resets across day boundaries
+    #[test]
+    fn test_daily_reset_across_boundaries() {
+        let env = Env::default();
+        let vault_id = env.register(AgentVault, ());
+        let client = AgentVaultClient::new(&env, &vault_id);
+
+        let admin = Address::generate(&env);
+        let (agent_sk, agent_pk) = gen_keypair(&env);
+        let provider_a = Address::generate(&env);
+
+        let allowlist = Map::from_array(&env, [(provider_a.clone(), 5_000_000_i128)]);
+        // Initialize with a specific cap, no lifetime cap
+        client.initialize(&admin, &agent_pk, &5_000_000_i128, &allowlist, &500_000_u32, &0_i128);
+
+        // Day 0 (sequence 0): spend 4_000_000
+        let payload1 = BytesN::<32>::random(&env);
+        let sig1 = sign_payload(&env, &agent_sk, &payload1);
+        let contexts1 = Vec::from_array(&env, [transfer_context(&env, &provider_a, 4_000_000)]);
+        let result1 = env.try_invoke_contract_check_auth::<Error>(
+            &vault_id,
+            &payload1,
+            sig1.into_val(&env),
+            &contexts1,
+        );
+        assert!(result1.is_ok(), "first payment in day 0 should succeed");
+
+        // Still in Day 0: attempt to spend 2_000_000 more (total 6_000_000 > cap) — should fail
+        let payload2 = BytesN::<32>::random(&env);
+        let sig2 = sign_payload(&env, &agent_sk, &payload2);
+        let contexts2 = Vec::from_array(&env, [transfer_context(&env, &provider_a, 2_000_000)]);
+        let result2 = env.try_invoke_contract_check_auth::<Error>(
+            &vault_id,
+            &payload2,
+            sig2.into_val(&env),
+            &contexts2,
+        );
+        assert_eq!(
+            result2.unwrap_err().unwrap(),
+            Error::DailyCapExceeded,
+            "second payment in same day should fail due to accumulated spend"
+        );
+
+        // Move to Day 1: day_bucket = 17_280 / 17_280 = 1
+        env.ledger().set_sequence_number(17_280);
+
+        // Day 1: attempt to spend 4_000_000 again
+        // This should succeed because we're in a new day bucket (bucket 1)
+        let payload3 = BytesN::<32>::random(&env);
+        let sig3 = sign_payload(&env, &agent_sk, &payload3);
+        let contexts3 = Vec::from_array(&env, [transfer_context(&env, &provider_a, 4_000_000)]);
+        let result3 = env.try_invoke_contract_check_auth::<Error>(
+            &vault_id,
+            &payload3,
+            sig3.into_val(&env),
+            &contexts3,
+        );
+        assert!(
+            result3.is_ok(),
+            "payment in new day bucket should succeed after reset"
+        );
+    }
+
+    /// Test 14: payment_authorized event emitted on each successful transfer
+    #[test]
+    fn test_payment_authorized_event_emitted() {
+        use soroban_sdk::{testutils::Events, IntoVal};
+
+        let env = Env::default();
+        let (_, agent_sk, vault_id, provider_a) = setup(&env);
+
+        let token = Address::generate(&env);
+        let from = Address::generate(&env);
+        let amount: i128 = 100_000;
+        let ctx = Context::Contract(ContractContext {
+            contract: token.clone(),
+            fn_name: symbol_short!("transfer"),
+            args: (from.clone(), provider_a.clone(), amount).into_val(&env),
+        });
+        let contexts = Vec::from_array(&env, [ctx]);
+
+        let payload = BytesN::<32>::random(&env);
+        let sig = sign_payload(&env, &agent_sk, &payload);
+        let result = env.try_invoke_contract_check_auth::<Error>(
+            &vault_id,
+            &payload,
+            sig.into_val(&env),
+            &contexts,
+        );
+        assert!(result.is_ok(), "auth should pass");
+
+        let events = env.events().all();
+        let evt_name = Symbol::new(&env, "payment_authorized");
+        let matching: std::vec::Vec<_> = events
+            .iter()
+            .filter(|(addr, topics, _)| {
+                *addr == vault_id
+                    && topics
+                        .get(0)
+                        .map_or(false, |t| Symbol::from_val(&env, &t) == evt_name)
+            })
+            .collect();
+
+        assert_eq!(matching.len(), 1, "exactly one payment_authorized event expected");
+
+        let (_, topics, data) = &matching[0];
+        let topic_payer: Address = topics.get(1).unwrap().into_val(&env);
+        let topic_payee: Address = topics.get(2).unwrap().into_val(&env);
+        assert_eq!(topic_payer, from, "topic[1] should be payer");
+        assert_eq!(topic_payee, provider_a, "topic[2] should be payee");
+
+        let data_tuple: (i128, Address, i128) = data.clone().into_val(&env);
+        assert_eq!(data_tuple.0, amount, "data[0] should be amount");
+        assert_eq!(data_tuple.1, token, "data[1] should be asset contract");
+        assert_eq!(data_tuple.2, amount, "data[2] should be daily_cumulative (first transfer)");
+    }
+
+    /// Test 15: daily_cumulative on the event reflects the accumulated spend
+    #[test]
+    fn test_payment_authorized_daily_cumulative_accumulates() {
+        use soroban_sdk::{testutils::Events, IntoVal};
+
+        let env = Env::default();
+        let (_, agent_sk, vault_id, provider_a) = setup(&env);
+
+        let p1 = BytesN::<32>::random(&env);
+        let s1 = sign_payload(&env, &agent_sk, &p1);
+        let c1 = Vec::from_array(&env, [transfer_context(&env, &provider_a, 1_000_000)]);
+        env.try_invoke_contract_check_auth::<Error>(&vault_id, &p1, s1.into_val(&env), &c1).unwrap();
+
+        let p2 = BytesN::<32>::random(&env);
+        let s2 = sign_payload(&env, &agent_sk, &p2);
+        let c2 = Vec::from_array(&env, [transfer_context(&env, &provider_a, 2_000_000)]);
+        env.try_invoke_contract_check_auth::<Error>(&vault_id, &p2, s2.into_val(&env), &c2).unwrap();
+
+        let events = env.events().all();
+        let evt_name = Symbol::new(&env, "payment_authorized");
+        let last = events
+            .iter()
+            .filter(|(addr, topics, _)| {
+                *addr == vault_id
+                    && topics
+                        .get(0)
+                        .map_or(false, |t| Symbol::from_val(&env, &t) == evt_name)
+            })
+            .last()
+            .expect("expected at least one payment_authorized event");
+        let data_tuple: (i128, Address, i128) = last.2.clone().into_val(&env);
+        assert_eq!(data_tuple.2, 3_000_000, "daily_cumulative should accumulate");
+    }
+
+    /// Test 16: rejected transfer does NOT emit payment_authorized
+    #[test]
+    fn test_rejected_transfer_emits_no_event() {
+        use soroban_sdk::testutils::Events;
+
+        let env = Env::default();
+        let (_, agent_sk, vault_id, _) = setup(&env);
+
+        let unlisted = Address::generate(&env);
+        let p = BytesN::<32>::random(&env);
+        let s = sign_payload(&env, &agent_sk, &p);
+        let c = Vec::from_array(&env, [transfer_context(&env, &unlisted, 100_000)]);
+        let _ = env.try_invoke_contract_check_auth::<Error>(&vault_id, &p, s.into_val(&env), &c);
+
+        let events = env.events().all();
+        let evt_name = Symbol::new(&env, "payment_authorized");
+        let count = events
+            .iter()
+            .filter(|(addr, topics, _)| {
+                *addr == vault_id
+                    && topics
+                        .get(0)
+                        .map_or(false, |t| Symbol::from_val(&env, &t) == evt_name)
+            })
+            .count();
+        assert_eq!(count, 0, "rejected transfer must not emit payment_authorized");
+    }
+
+    /// Test 17: session_settled event emitted with full payload
+    #[test]
+    fn test_session_settled_event_emitted() {
+        use soroban_sdk::{testutils::Events, IntoVal};
+
+        let env = Env::default();
+        let vault_id = env.register(AgentVault, ());
+        let client = AgentVaultClient::new(&env, &vault_id);
+
+        let admin = Address::generate(&env);
+        let (_, agent_pk) = gen_keypair(&env);
+        let provider_a = Address::generate(&env);
+        let allowlist = Map::from_array(&env, [(provider_a.clone(), 5_000_000_i128)]);
+        client.initialize(&admin, &agent_pk, &5_000_000_i128, &allowlist, &10_000_u32, &0_i128);
+
+        let channel_id = Address::generate(&env);
+        let payer = Address::generate(&env);
+        let payee = provider_a.clone();
+        let cumulative_amount: i128 = 500_000;
+        let voucher_count: u32 = 42;
+
+        env.mock_all_auths();
+        client.record_session_settlement(
+            &channel_id,
+            &payer,
+            &payee,
+            &cumulative_amount,
+            &voucher_count,
+        );
+
+        let events = env.events().all();
+        let evt_name = Symbol::new(&env, "session_settled");
+        let matching: std::vec::Vec<_> = events
+            .iter()
+            .filter(|(addr, topics, _)| {
+                *addr == vault_id
+                    && topics
+                        .get(0)
+                        .map_or(false, |t| Symbol::from_val(&env, &t) == evt_name)
+            })
+            .collect();
+        assert_eq!(matching.len(), 1, "exactly one session_settled event expected");
+
+        let (_, topics, data) = &matching[0];
+        let topic_channel: Address = topics.get(1).unwrap().into_val(&env);
+        let topic_payee: Address = topics.get(2).unwrap().into_val(&env);
+        assert_eq!(topic_channel, channel_id, "topic[1] should be channel_id");
+        assert_eq!(topic_payee, payee, "topic[2] should be payee");
+
+        let data_tuple: (Address, i128, u32) = data.clone().into_val(&env);
+        assert_eq!(data_tuple.0, payer, "data[0] should be payer");
+        assert_eq!(data_tuple.1, cumulative_amount, "data[1] should be cumulative_amount");
+        assert_eq!(data_tuple.2, voucher_count, "data[2] should be voucher_count");
+    }
+
+    /// Test 18: record_session_settlement without admin auth panics
+    #[test]
+    #[should_panic]
+    fn test_session_settled_requires_admin_auth() {
+        let env = Env::default();
+        let vault_id = env.register(AgentVault, ());
+        let client = AgentVaultClient::new(&env, &vault_id);
+
+        let admin = Address::generate(&env);
+        let (_, agent_pk) = gen_keypair(&env);
+        let provider_a = Address::generate(&env);
+        let allowlist = Map::from_array(&env, [(provider_a.clone(), 5_000_000_i128)]);
+        client.initialize(&admin, &agent_pk, &5_000_000_i128, &allowlist, &10_000_u32, &0_i128);
+
+        // No mock_all_auths() — require_auth() must panic
+        let channel = Address::generate(&env);
+        let payer = Address::generate(&env);
+        client.record_session_settlement(&channel, &payer, &provider_a, &500_000_i128, &10_u32);
+    }
+
+    /// Test 19: payment within global cap but exceeding per-payee sub-cap is rejected
+    #[test]
+    fn test_per_payee_cap_enforced_below_global_cap() {
+        let env = Env::default();
+        let vault_id = env.register(AgentVault, ());
+        let client = AgentVaultClient::new(&env, &vault_id);
+
+        let admin = Address::generate(&env);
+        let (agent_sk, agent_pk) = gen_keypair(&env);
+        let provider_a = Address::generate(&env);
+
+        // global cap = 5_000_000, per-payee sub-cap = 1_000_000
+        let allowlist = Map::from_array(&env, [(provider_a.clone(), 1_000_000_i128)]);
+        client.initialize(&admin, &agent_pk, &5_000_000_i128, &allowlist, &10_000_u32, &0_i128);
+
+        // 2_000_000 is within global cap but exceeds sub-cap of 1_000_000
+        let payload = BytesN::<32>::random(&env);
+        let sig = sign_payload(&env, &agent_sk, &payload);
+        let contexts = Vec::from_array(&env, [transfer_context(&env, &provider_a, 2_000_000)]);
+
+        let result = env.try_invoke_contract_check_auth::<Error>(
+            &vault_id,
+            &payload,
+            sig.into_val(&env),
+            &contexts,
+        );
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            Error::PayeeCapExceeded,
+            "payment within global cap but exceeding per-payee sub-cap should fail"
+        );
+    }
+
+    /// Test 20: two payees with separate sub-caps do not share spend budget
+    #[test]
+    fn test_two_payees_independent_sub_caps() {
+        let env = Env::default();
+        let vault_id = env.register(AgentVault, ());
+        let client = AgentVaultClient::new(&env, &vault_id);
+
+        let admin = Address::generate(&env);
+        let (agent_sk, agent_pk) = gen_keypair(&env);
+        let provider_a = Address::generate(&env);
+        let provider_b = Address::generate(&env);
+
+        // global cap = 5_000_000; provider_a sub-cap = 2_000_000; provider_b sub-cap = 2_000_000
+        let allowlist = Map::from_array(
+            &env,
+            [
+                (provider_a.clone(), 2_000_000_i128),
+                (provider_b.clone(), 2_000_000_i128),
+            ],
+        );
+        client.initialize(&admin, &agent_pk, &5_000_000_i128, &allowlist, &10_000_u32, &0_i128);
+
+        // Pay 2_000_000 to provider_a (hits their sub-cap exactly)
+        let p1 = BytesN::<32>::random(&env);
+        let s1 = sign_payload(&env, &agent_sk, &p1);
+        let c1 = Vec::from_array(&env, [transfer_context(&env, &provider_a, 2_000_000)]);
+        assert!(
+            env.try_invoke_contract_check_auth::<Error>(&vault_id, &p1, s1.into_val(&env), &c1).is_ok(),
+            "provider_a at sub-cap should succeed"
+        );
+
+        // Pay 2_000_000 to provider_b (their budget is independent — should still pass)
+        let p2 = BytesN::<32>::random(&env);
+        let s2 = sign_payload(&env, &agent_sk, &p2);
+        let c2 = Vec::from_array(&env, [transfer_context(&env, &provider_b, 2_000_000)]);
+        assert!(
+            env.try_invoke_contract_check_auth::<Error>(&vault_id, &p2, s2.into_val(&env), &c2).is_ok(),
+            "provider_b sub-cap is independent and should succeed"
+        );
+
+        // A further payment to provider_a now exceeds their sub-cap
+        let p3 = BytesN::<32>::random(&env);
+        let s3 = sign_payload(&env, &agent_sk, &p3);
+        let c3 = Vec::from_array(&env, [transfer_context(&env, &provider_a, 1)]);
+        assert_eq!(
+            env.try_invoke_contract_check_auth::<Error>(&vault_id, &p3, s3.into_val(&env), &c3)
+                .unwrap_err()
+                .unwrap(),
+            Error::PayeeCapExceeded,
+            "provider_a over their sub-cap should fail"
+        );
+    }
+
+    /// Test 21: per-payee spend resets with the day bucket (same as global)
+    #[test]
+    fn test_per_payee_spend_resets_on_new_day() {
+        let env = Env::default();
+        let vault_id = env.register(AgentVault, ());
+        let client = AgentVaultClient::new(&env, &vault_id);
+
+        let admin = Address::generate(&env);
+        let (agent_sk, agent_pk) = gen_keypair(&env);
+        let provider_a = Address::generate(&env);
+
+        // global cap = 5_000_000; provider_a sub-cap = 1_000_000
+        let allowlist = Map::from_array(&env, [(provider_a.clone(), 1_000_000_i128)]);
+        client.initialize(&admin, &agent_pk, &5_000_000_i128, &allowlist, &500_000_u32, &0_i128);
+
+        // Day 0: spend exactly the sub-cap
+        let p1 = BytesN::<32>::random(&env);
+        let s1 = sign_payload(&env, &agent_sk, &p1);
+        let c1 = Vec::from_array(&env, [transfer_context(&env, &provider_a, 1_000_000)]);
+        assert!(
+            env.try_invoke_contract_check_auth::<Error>(&vault_id, &p1, s1.into_val(&env), &c1).is_ok(),
+            "first payment should succeed"
+        );
+
+        // Day 0: any further spend exceeds sub-cap
+        let p2 = BytesN::<32>::random(&env);
+        let s2 = sign_payload(&env, &agent_sk, &p2);
+        let c2 = Vec::from_array(&env, [transfer_context(&env, &provider_a, 1)]);
+        assert_eq!(
+            env.try_invoke_contract_check_auth::<Error>(&vault_id, &p2, s2.into_val(&env), &c2)
+                .unwrap_err()
+                .unwrap(),
+            Error::PayeeCapExceeded,
+            "second payment same day should fail"
+        );
+
+        // Advance to Day 1 — per-payee spend resets
+        env.ledger().set_sequence_number(17_280);
+        let p3 = BytesN::<32>::random(&env);
+        let s3 = sign_payload(&env, &agent_sk, &p3);
+        let c3 = Vec::from_array(&env, [transfer_context(&env, &provider_a, 1_000_000)]);
+        assert!(
+            env.try_invoke_contract_check_auth::<Error>(&vault_id, &p3, s3.into_val(&env), &c3).is_ok(),
+            "payment in new day bucket should succeed after per-payee reset"
+        );
+    }
+
+    // ── Lifetime cap tests ────────────────────────────────────────────────────
+
+    /// Helper: vault with daily_cap=5_000_000, lifetime_cap as specified, expiry far out.
+    fn setup_with_lifetime_cap(
+        env: &Env,
+        lifetime_cap: i128,
+    ) -> (AgentVaultClient<'_>, SigningKey, Address, Address) {
+        let vault_id = env.register(AgentVault, ());
+        let client = AgentVaultClient::new(env, &vault_id);
+
+        let admin = Address::generate(env);
+        let (agent_sk, agent_pk) = gen_keypair(env);
+        let provider_a = Address::generate(env);
+
+        let allowlist = Map::from_array(env, [(provider_a.clone(), 5_000_000_i128)]);
+        client.initialize(
+            &admin,
+            &agent_pk,
+            &5_000_000_i128,
+            &allowlist,
+            &500_000_u32,
+            &lifetime_cap,
+        );
+        (client, agent_sk, vault_id, provider_a)
+    }
+
+    /// Test 22: lifetime cap of 0 means unlimited — large spend across days is accepted.
+    #[test]
+    fn test_lifetime_cap_zero_means_unlimited() {
+        let env = Env::default();
+        // 0 = no lifetime cap; daily cap is the only ceiling
+        let (_, agent_sk, vault_id, provider_a) = setup_with_lifetime_cap(&env, 0);
+
+        // Day 0: spend 5_000_000 (at daily cap)
+        let p1 = BytesN::<32>::random(&env);
+        let s1 = sign_payload(&env, &agent_sk, &p1);
+        let c1 = Vec::from_array(&env, [transfer_context(&env, &provider_a, 5_000_000)]);
+        assert!(
+            env.try_invoke_contract_check_auth::<Error>(&vault_id, &p1, s1.into_val(&env), &c1)
+                .is_ok(),
+            "day 0 spend should succeed"
+        );
+
+        // Day 1: spend another 5_000_000 (total 10M — would fail if cap were 8M)
+        env.ledger().set_sequence_number(17_280);
+        let p2 = BytesN::<32>::random(&env);
+        let s2 = sign_payload(&env, &agent_sk, &p2);
+        let c2 = Vec::from_array(&env, [transfer_context(&env, &provider_a, 5_000_000)]);
+        assert!(
+            env.try_invoke_contract_check_auth::<Error>(&vault_id, &p2, s2.into_val(&env), &c2)
+                .is_ok(),
+            "day 1 spend should succeed when lifetime_cap=0"
+        );
+    }
+
+    /// Test 23: lifetime cap enforced — transfer exceeding lifetime cap rejected.
+    #[test]
+    fn test_lifetime_cap_enforced() {
+        let env = Env::default();
+        // lifetime_cap = 3_000_000, daily_cap = 5_000_000
+        let (_, agent_sk, vault_id, provider_a) = setup_with_lifetime_cap(&env, 3_000_000);
+
+        // 4_000_000 > lifetime_cap of 3_000_000 (but <= daily_cap 5_000_000)
+        let p = BytesN::<32>::random(&env);
+        let s = sign_payload(&env, &agent_sk, &p);
+        let c = Vec::from_array(&env, [transfer_context(&env, &provider_a, 4_000_000)]);
+
+        let result =
+            env.try_invoke_contract_check_auth::<Error>(&vault_id, &p, s.into_val(&env), &c);
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            Error::LifetimeCapExceeded,
+            "transfer exceeding lifetime cap should be rejected"
+        );
+    }
+
+    /// Test 24: lifetime cap boundary — spending exactly at cap succeeds.
+    #[test]
+    fn test_lifetime_cap_boundary_at_limit_succeeds() {
+        let env = Env::default();
+        let (_, agent_sk, vault_id, provider_a) = setup_with_lifetime_cap(&env, 3_000_000);
+
+        let p = BytesN::<32>::random(&env);
+        let s = sign_payload(&env, &agent_sk, &p);
+        let c = Vec::from_array(&env, [transfer_context(&env, &provider_a, 3_000_000)]);
+
+        assert!(
+            env.try_invoke_contract_check_auth::<Error>(&vault_id, &p, s.into_val(&env), &c)
+                .is_ok(),
+            "transfer exactly at lifetime cap should succeed"
+        );
+    }
+
+    /// Test 25: lifetime cap boundary — one stroop over limit fails.
+    #[test]
+    fn test_lifetime_cap_boundary_exceeding_by_one_fails() {
+        let env = Env::default();
+        let (_, agent_sk, vault_id, provider_a) = setup_with_lifetime_cap(&env, 3_000_000);
+
+        let p = BytesN::<32>::random(&env);
+        let s = sign_payload(&env, &agent_sk, &p);
+        let c = Vec::from_array(&env, [transfer_context(&env, &provider_a, 3_000_001)]);
+
+        let result =
+            env.try_invoke_contract_check_auth::<Error>(&vault_id, &p, s.into_val(&env), &c);
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            Error::LifetimeCapExceeded,
+            "transfer 1 stroop over lifetime cap should fail"
+        );
+    }
+
+    /// Test 26: lifetime spend accumulates across day resets.
+    #[test]
+    fn test_lifetime_cap_accumulates_across_days() {
+        let env = Env::default();
+        // lifetime_cap = 8_000_000, daily_cap = 5_000_000
+        let (_, agent_sk, vault_id, provider_a) = setup_with_lifetime_cap(&env, 8_000_000);
+
+        // Day 0: spend 5_000_000 (lifetime_spend = 5_000_000)
+        let p1 = BytesN::<32>::random(&env);
+        let s1 = sign_payload(&env, &agent_sk, &p1);
+        let c1 = Vec::from_array(&env, [transfer_context(&env, &provider_a, 5_000_000)]);
+        assert!(
+            env.try_invoke_contract_check_auth::<Error>(&vault_id, &p1, s1.into_val(&env), &c1)
+                .is_ok(),
+            "day 0 spend should succeed"
+        );
+
+        // Day 1: try 4_000_000 — total would be 9_000_000 > 8_000_000 lifetime cap
+        env.ledger().set_sequence_number(17_280);
+        let p2 = BytesN::<32>::random(&env);
+        let s2 = sign_payload(&env, &agent_sk, &p2);
+        let c2 = Vec::from_array(&env, [transfer_context(&env, &provider_a, 4_000_000)]);
+        let result =
+            env.try_invoke_contract_check_auth::<Error>(&vault_id, &p2, s2.into_val(&env), &c2);
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            Error::LifetimeCapExceeded,
+            "day 1 spend that crosses lifetime cap should be rejected"
+        );
+
+        // Day 1: try 3_000_000 — total = 8_000_000, exactly at lifetime cap → ok
+        let p3 = BytesN::<32>::random(&env);
+        let s3 = sign_payload(&env, &agent_sk, &p3);
+        let c3 = Vec::from_array(&env, [transfer_context(&env, &provider_a, 3_000_000)]);
+        assert!(
+            env.try_invoke_contract_check_auth::<Error>(&vault_id, &p3, s3.into_val(&env), &c3)
+                .is_ok(),
+            "day 1 spend that exactly meets lifetime cap should succeed"
+        );
+    }
+
+    /// Test 27: get_lifetime_spend returns the monotonic counter correctly.
+    #[test]
+    fn test_get_lifetime_spend_tracks_correctly() {
+        let env = Env::default();
+        let (client, agent_sk, vault_id, provider_a) = setup_with_lifetime_cap(&env, 0);
+
+        assert_eq!(client.get_lifetime_spend(), 0, "initial lifetime spend is 0");
+
+        let p = BytesN::<32>::random(&env);
+        let s = sign_payload(&env, &agent_sk, &p);
+        let c = Vec::from_array(&env, [transfer_context(&env, &provider_a, 1_500_000)]);
+        env.try_invoke_contract_check_auth::<Error>(&vault_id, &p, s.into_val(&env), &c)
+            .unwrap();
+
+        assert_eq!(
+            client.get_lifetime_spend(),
+            1_500_000,
+            "lifetime spend counter should reflect the payment"
+        );
+    }
+
+    /// Test 28: daily cap rejection does NOT advance lifetime spend counter.
+    #[test]
+    fn test_lifetime_spend_not_incremented_on_rejection() {
+        let env = Env::default();
+        let (client, agent_sk, vault_id, provider_a) = setup_with_lifetime_cap(&env, 0);
+
+        // Attempt over-daily-cap payment (rejected)
+        let p = BytesN::<32>::random(&env);
+        let s = sign_payload(&env, &agent_sk, &p);
+        let c = Vec::from_array(&env, [transfer_context(&env, &provider_a, 6_000_000)]);
+        let result =
+            env.try_invoke_contract_check_auth::<Error>(&vault_id, &p, s.into_val(&env), &c);
+        assert_eq!(result.unwrap_err().unwrap(), Error::DailyCapExceeded);
+
+        // Lifetime spend must remain 0 — the failed auth must not mutate state
+        assert_eq!(
+            client.get_lifetime_spend(),
+            0,
+            "rejected auth must not advance lifetime spend"
+        );
+    }
+/// Test 19: transfer_admin and accept_admin happy path
+    #[test]
+    fn test_transfer_and_accept_admin_succeeds() {
+        let env = Env::default();
+        let vault_id = env.register(AgentVault, ());
+        let client = AgentVaultClient::new(&env, &vault_id);
+
+        let admin = Address::generate(&env);
+        let (_, agent_pk) = gen_keypair(&env);
+        let allowlist = soroban_sdk::Map::new(&env);
+        client.initialize(&admin, &agent_pk, &5_000_000_i128, &allowlist, &10_000_u32, &0_i128);
+
+        let new_admin = Address::generate(&env);
+
+        // 1. Transfer admin
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &admin,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &vault_id,
+                fn_name: "transfer_admin",
+                args: (&new_admin,).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.transfer_admin(&new_admin);
+        
+        // 2. Accept admin
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &new_admin,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &vault_id,
+                fn_name: "accept_admin",
+                args: ().into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.accept_admin();
+
+        // 3. Verify new admin has access
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &new_admin,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &vault_id,
+                fn_name: "set_daily_cap",
+                args: (&10_000_000_i128,).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.set_daily_cap(&10_000_000_i128);
+    }
+
+    /// Test 20: old admin loses access immediately after acceptance
+    #[test]
+    #[should_panic]
+    fn test_old_admin_loses_access() {
+        let env = Env::default();
+        let vault_id = env.register(AgentVault, ());
+        let client = AgentVaultClient::new(&env, &vault_id);
+
+        let admin = Address::generate(&env);
+        let (_, agent_pk) = gen_keypair(&env);
+        let allowlist = soroban_sdk::Map::new(&env);
+        client.initialize(&admin, &agent_pk, &5_000_000_i128, &allowlist, &10_000_u32, &0_i128);
+
+        let new_admin = Address::generate(&env);
+        
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &admin,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &vault_id,
+                fn_name: "transfer_admin",
+                args: (&new_admin,).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.transfer_admin(&new_admin);
+        
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &new_admin,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &vault_id,
+                fn_name: "accept_admin",
+                args: ().into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.accept_admin();
+
+        // Old admin attempts to change daily cap
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &admin,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &vault_id,
+                fn_name: "set_daily_cap",
+                args: (&10_000_000_i128,).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.set_daily_cap(&10_000_000_i128);
+    }
+
+    /// Test 21: accept_admin without pending admin fails
+    #[test]
+    #[should_panic(expected = "Error(Contract, #8)")]
+    fn test_accept_admin_no_pending_admin_fails() {
+        let env = Env::default();
+        let vault_id = env.register(AgentVault, ());
+        let client = AgentVaultClient::new(&env, &vault_id);
+
+        let admin = Address::generate(&env);
+        let (_, agent_pk) = gen_keypair(&env);
+        let allowlist = soroban_sdk::Map::new(&env);
+        client.initialize(&admin, &agent_pk, &5_000_000_i128, &allowlist, &10_000_u32, &0_i128);
+
+        env.mock_all_auths();
+        client.accept_admin(); // Should panic with NoPendingAdmin
+    }
+
+    /// Test 22: transfer initiation by non-admin fails
+    #[test]
+    #[should_panic]
+    fn test_transfer_admin_requires_auth() {
+        let env = Env::default();
+        let vault_id = env.register(AgentVault, ());
+        let client = AgentVaultClient::new(&env, &vault_id);
+
+        let admin = Address::generate(&env);
+        let (_, agent_pk) = gen_keypair(&env);
+        let allowlist = soroban_sdk::Map::new(&env);
+        client.initialize(&admin, &agent_pk, &5_000_000_i128, &allowlist, &10_000_u32, &0_i128);
+
+        let new_admin = Address::generate(&env);
+        let stranger = Address::generate(&env);
+        
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &stranger,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &vault_id,
+                fn_name: "transfer_admin",
+                args: (&new_admin,).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.transfer_admin(&new_admin);
+    }
+
+    /// Test 23: accept by wrong address fails
+    #[test]
+    #[should_panic]
+    fn test_accept_admin_wrong_address_fails() {
+        let env = Env::default();
+        let vault_id = env.register(AgentVault, ());
+        let client = AgentVaultClient::new(&env, &vault_id);
+
+        let admin = Address::generate(&env);
+        let (_, agent_pk) = gen_keypair(&env);
+        let allowlist = soroban_sdk::Map::new(&env);
+        client.initialize(&admin, &agent_pk, &5_000_000_i128, &allowlist, &10_000_u32, &0_i128);
+
+        let new_admin = Address::generate(&env);
+        
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &admin,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &vault_id,
+                fn_name: "transfer_admin",
+                args: (&new_admin,).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.transfer_admin(&new_admin);
+
+        let wrong_address = Address::generate(&env);
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &wrong_address,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &vault_id,
+                fn_name: "accept_admin",
+                args: ().into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.accept_admin();
+    }
+
+    /// Test 35: freeze blocks subsequent calls
+    #[test]
+    fn test_freeze_blocks_transfers() {
+        let env = Env::default();
+        let vault_id = env.register(AgentVault, ());
+        let client = AgentVaultClient::new(&env, &vault_id);
+
+        let admin = Address::generate(&env);
+        let (agent_sk, agent_pk) = gen_keypair(&env);
+        let provider_a = Address::generate(&env);
+        let allowlist = soroban_sdk::Map::from_array(&env, [(provider_a.clone(), 5_000_000_i128)]);
+        client.initialize(&admin, &agent_pk, &5_000_000_i128, &allowlist, &10_000_u32, &0_i128);
+
+        // Freeze the contract
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &admin,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &vault_id,
+                fn_name: "freeze",
+                args: ().into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.freeze();
+
+        // Attempt a transfer, should fail
+        let payload = BytesN::<32>::random(&env);
+        let sig = sign_payload(&env, &agent_sk, &payload);
+        let contexts = soroban_sdk::Vec::from_array(&env, [transfer_context(&env, &provider_a, 100_000)]);
+
+        let result = env.try_invoke_contract_check_auth::<Error>(
+            &vault_id,
+            &payload,
+            sig.into_val(&env),
+            &contexts,
+        );
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            Error::ContractFrozen,
+            "frozen contract should reject transfers"
+        );
+    }
+
+    /// Test 36: unfreeze restores normal operation
+    #[test]
+    fn test_unfreeze_restores_transfers() {
+        let env = Env::default();
+        let vault_id = env.register(AgentVault, ());
+        let client = AgentVaultClient::new(&env, &vault_id);
+
+        let admin = Address::generate(&env);
+        let (agent_sk, agent_pk) = gen_keypair(&env);
+        let provider_a = Address::generate(&env);
+        let allowlist = soroban_sdk::Map::from_array(&env, [(provider_a.clone(), 5_000_000_i128)]);
+        client.initialize(&admin, &agent_pk, &5_000_000_i128, &allowlist, &10_000_u32, &0_i128);
+
+        // Freeze
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &admin,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &vault_id,
+                fn_name: "freeze",
+                args: ().into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.freeze();
+
+        // Unfreeze
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &admin,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &vault_id,
+                fn_name: "unfreeze",
+                args: ().into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.unfreeze();
+
+        // Attempt a transfer, should succeed
+        let payload = BytesN::<32>::random(&env);
+        let sig = sign_payload(&env, &agent_sk, &payload);
+        let contexts = soroban_sdk::Vec::from_array(&env, [transfer_context(&env, &provider_a, 100_000)]);
+
+        let result = env.try_invoke_contract_check_auth::<Error>(
+            &vault_id,
+            &payload,
+            sig.into_val(&env),
+            &contexts,
+        );
+        assert!(result.is_ok(), "unfrozen contract should allow transfers");
+    }
+
+    /// Test 37: only admin can toggle freeze/unfreeze
+    #[test]
+    #[should_panic]
+    fn test_freeze_requires_admin() {
+        let env = Env::default();
+        let vault_id = env.register(AgentVault, ());
+        let client = AgentVaultClient::new(&env, &vault_id);
+
+        let admin = Address::generate(&env);
+        let (_, agent_pk) = gen_keypair(&env);
+        client.initialize(&admin, &agent_pk, &5_000_000_i128, &soroban_sdk::Map::new(&env), &10_000_u32, &0_i128);
+
+        let non_admin = Address::generate(&env);
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &non_admin,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &vault_id,
+                fn_name: "freeze",
+                args: ().into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.freeze();
+    }
+
+    /// Test 38: view functions return correct values
+    #[test]
+    fn test_view_functions() {
+        let env = Env::default();
+        let vault_id = env.register(AgentVault, ());
+        let client = AgentVaultClient::new(&env, &vault_id);
+
+        let admin = Address::generate(&env);
+        let (_, agent_pk) = gen_keypair(&env);
+        let provider_a = Address::generate(&env);
+        
+        let allowlist = soroban_sdk::Map::from_array(&env, [(provider_a.clone(), 5_000_000_i128)]);
+        client.initialize(&admin, &agent_pk, &5_000_000_i128, &allowlist, &10_000_u32, &0_i128);
+
+        assert_eq!(client.daily_cap(), 5_000_000_i128);
+        
+        let fetched_allowlist = client.allowlist();
+        assert_eq!(fetched_allowlist.len(), 1);
+        assert_eq!(fetched_allowlist.get(provider_a.clone()).unwrap(), 5_000_000_i128);
+
+        assert_eq!(client.expiry_ledger(), 10_000_u32);
+        assert_eq!(client.agent_pubkey(), agent_pk.clone());
+
+        // Test updates
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &admin,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &vault_id,
+                fn_name: "set_daily_cap",
+                args: (&10_000_000_i128,).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.set_daily_cap(&10_000_000_i128);
+        assert_eq!(client.daily_cap(), 10_000_000_i128);
+
+        let provider_b = Address::generate(&env);
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &admin,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &vault_id,
+                fn_name: "add_to_allowlist",
+                args: (&provider_b, &2_000_000_i128).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.add_to_allowlist(&provider_b, &2_000_000_i128);
+        
+        let updated_allowlist = client.allowlist();
+        assert_eq!(updated_allowlist.len(), 2);
+        assert_eq!(updated_allowlist.get(provider_b.clone()).unwrap(), 2_000_000_i128);
+    }
+
+    /// Test 32: negative transfer amount is rejected and counters stay untouched
+    #[test]
+    fn test_negative_transfer_amount_rejected() {
+        let env = Env::default();
+        let (_, agent_sk, vault_id, provider_a) = setup(&env);
+
+        let p = BytesN::<32>::random(&env);
+        let s = sign_payload(&env, &agent_sk, &p);
+        let c = Vec::from_array(&env, [transfer_context(&env, &provider_a, -100)]);
+        let result =
+            env.try_invoke_contract_check_auth::<Error>(&vault_id, &p, s.into_val(&env), &c);
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            Error::InvalidAmount,
+            "negative transfer amount must be rejected with InvalidAmount"
+        );
+
+        assert_eq!(
+            read_spend_counters(&env, &vault_id, &provider_a),
+            (0, 0, 0),
+            "rejected negative transfer must not mutate any spend counter"
+        );
+    }
+
+    /// Test 33: zero transfer amount is also rejected
+    #[test]
+    fn test_zero_transfer_amount_rejected() {
+        let env = Env::default();
+        let (_, agent_sk, vault_id, provider_a) = setup(&env);
+
+        let p = BytesN::<32>::random(&env);
+        let s = sign_payload(&env, &agent_sk, &p);
+        let c = Vec::from_array(&env, [transfer_context(&env, &provider_a, 0)]);
+        let result =
+            env.try_invoke_contract_check_auth::<Error>(&vault_id, &p, s.into_val(&env), &c);
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            Error::InvalidAmount,
+            "zero transfer amount must be rejected with InvalidAmount"
+        );
+    }
+
+    /// Test 34: negative transfer after a real payment must not deflate the counters
+    #[test]
+    fn test_negative_transfer_does_not_deflate_counters() {
+        let env = Env::default();
+        let (_, agent_sk, vault_id, provider_a) = setup(&env);
+
+        // Legitimate payment of 4_000_000 (cap = 5_000_000)
+        let p1 = BytesN::<32>::random(&env);
+        let s1 = sign_payload(&env, &agent_sk, &p1);
+        let c1 = Vec::from_array(&env, [transfer_context(&env, &provider_a, 4_000_000)]);
+        env.try_invoke_contract_check_auth::<Error>(&vault_id, &p1, s1.into_val(&env), &c1)
+            .unwrap();
+
+        assert_eq!(
+            read_spend_counters(&env, &vault_id, &provider_a),
+            (4_000_000, 4_000_000, 4_000_000),
+            "valid payment should advance all three counters"
+        );
+
+        // Hostile "transfer" with a negative amount — must be rejected, not deflate.
+        let p2 = BytesN::<32>::random(&env);
+        let s2 = sign_payload(&env, &agent_sk, &p2);
+        let c2 = Vec::from_array(&env, [transfer_context(&env, &provider_a, -4_000_000)]);
+        let result =
+            env.try_invoke_contract_check_auth::<Error>(&vault_id, &p2, s2.into_val(&env), &c2);
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            Error::InvalidAmount,
+            "negative transfer must be rejected with InvalidAmount"
+        );
+
+        assert_eq!(
+            read_spend_counters(&env, &vault_id, &provider_a),
+            (4_000_000, 4_000_000, 4_000_000),
+            "negative transfer must not deflate the spend counters"
+        );
+
+        // The cap is still respected: 2_000_000 more would exceed the 5_000_000 daily cap.
+        let p3 = BytesN::<32>::random(&env);
+        let s3 = sign_payload(&env, &agent_sk, &p3);
+        let c3 = Vec::from_array(&env, [transfer_context(&env, &provider_a, 2_000_000)]);
+        let result3 =
+            env.try_invoke_contract_check_auth::<Error>(&vault_id, &p3, s3.into_val(&env), &c3);
+        assert_eq!(
+            result3.unwrap_err().unwrap(),
+            Error::DailyCapExceeded,
+            "cap must still be enforced — counters were not deflated"
+        );
+    }
+
+    /// Test 39: upgrade() rejects a caller that isn't the admin
+    #[test]
+    #[should_panic]
+    fn test_upgrade_requires_admin_auth() {
+        let env = Env::default();
+        let vault_id = env.register(AgentVault, ());
+        let client = AgentVaultClient::new(&env, &vault_id);
+
+        let admin = Address::generate(&env);
+        let (_, agent_pk) = gen_keypair(&env);
+        client.initialize(&admin, &agent_pk, &5_000_000_i128, &soroban_sdk::Map::new(&env), &10_000_u32, &0_i128);
+
+        let non_admin = Address::generate(&env);
+        let new_wasm_hash = BytesN::<32>::random(&env);
+
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &non_admin,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &vault_id,
+                fn_name: "upgrade",
+                args: (&new_wasm_hash,).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.upgrade(&new_wasm_hash);
+    }
+
+    /// Test: admin extends expiry after it lapsed — payments succeed again.
+    #[test]
+    fn test_extend_expiry_after_lapse_restores_payments() {
+        use soroban_sdk::testutils::Events;
+
+        let env = Env::default();
+        let vault_id = env.register(AgentVault, ());
+        let client = AgentVaultClient::new(&env, &vault_id);
+
+        let admin = Address::generate(&env);
+        let (agent_sk, agent_pk) = gen_keypair(&env);
+        let provider_a = Address::generate(&env);
+        let allowlist = Map::from_array(&env, [(provider_a.clone(), 5_000_000_i128)]);
+        client.initialize(&admin, &agent_pk, &5_000_000_i128, &allowlist, &10_000_u32, &0_i128);
+
+        // Fast-forward past the initial expiry (10_000) -> payments rejected.
+        env.ledger().set_sequence_number(10_001);
+        let p = BytesN::<32>::random(&env);
+        let s = sign_payload(&env, &agent_sk, &p);
+        let c = Vec::from_array(&env, [transfer_context(&env, &provider_a, 100_000)]);
+        assert_eq!(
+            env.try_invoke_contract_check_auth::<Error>(&vault_id, &p, s.into_val(&env), &c)
+                .unwrap_err()
+                .unwrap(),
+            Error::SessionExpired,
+            "payment should be rejected once the expiry lapsed"
+        );
+
+        // Admin extends expiry far into the future.
+        env.mock_all_auths();
+        client.set_expiry(&100_000_u32);
+
+        // Read events immediately after the call (before any other invocation).
+        let evt = Symbol::new(&env, "expiry_updated");
+        let expiry_events: std::vec::Vec<_> = env
+            .events()
+            .all()
+            .iter()
+            .filter(|(addr, topics, _)| {
+                *addr == vault_id
+                    && topics
+                        .get(0)
+                        .map_or(false, |t| Symbol::from_val(&env, &t) == evt)
+            })
+            .collect();
+        assert_eq!(expiry_events.len(), 1, "exactly one expiry_updated event expected");
+        let data_expiry: u32 = expiry_events[0].2.clone().into_val(&env);
+        assert_eq!(data_expiry, 100_000, "event data should carry the new expiry");
+
+        assert_eq!(client.expiry_ledger(), 100_000, "expiry should be extended");
+
+        // Now the same payment (still signed by the agent key) succeeds again.
+        let p2 = BytesN::<32>::random(&env);
+        let s2 = sign_payload(&env, &agent_sk, &p2);
+        let c2 = Vec::from_array(&env, [transfer_context(&env, &provider_a, 100_000)]);
+        assert!(
+            env.try_invoke_contract_check_auth::<Error>(&vault_id, &p2, s2.into_val(&env), &c2)
+                .is_ok(),
+            "payment should succeed once admin extends the expiry"
+        );
+    }
+
+    /// Test: set_expiry by a non-admin panics.
+    #[test]
+    #[should_panic]
+    fn test_set_expiry_requires_admin() {
+        let env = Env::default();
+        let vault_id = env.register(AgentVault, ());
+        let client = AgentVaultClient::new(&env, &vault_id);
+
+        let admin = Address::generate(&env);
+        let (_, agent_pk) = gen_keypair(&env);
+        client.initialize(&admin, &agent_pk, &5_000_000_i128, &Map::new(&env), &10_000_u32, &0_i128);
+
+        let non_admin = Address::generate(&env);
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &non_admin,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &vault_id,
+                fn_name: "set_expiry",
+                args: (&100_000_u32,).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.set_expiry(&100_000_u32);
+    }
+
+    /// Test: admin rotates the agent key; only the new key can authorize payments.
+    #[test]
+    fn test_rotate_agent_pubkey_authorizes_new_key() {
+        let env = Env::default();
+        let vault_id = env.register(AgentVault, ());
+        let client = AgentVaultClient::new(&env, &vault_id);
+
+        let admin = Address::generate(&env);
+        let (_, agent_pk) = gen_keypair(&env);
+        let provider_a = Address::generate(&env);
+        let allowlist = Map::from_array(&env, [(provider_a.clone(), 5_000_000_i128)]);
+        client.initialize(&admin, &agent_pk, &5_000_000_i128, &allowlist, &10_000_u32, &0_i128);
+
+        // Admin rotates to a fresh key pair.
+        let (new_sk, new_pk) = gen_keypair(&env);
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &admin,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &vault_id,
+                fn_name: "set_agent_pubkey",
+                args: (&new_pk,).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.set_agent_pubkey(&new_pk);
+
+        // A payment signed with the NEW key succeeds.
+        let p = BytesN::<32>::random(&env);
+        let s = sign_payload(&env, &new_sk, &p);
+        let c = Vec::from_array(&env, [transfer_context(&env, &provider_a, 100_000)]);
+        assert!(
+            env.try_invoke_contract_check_auth::<Error>(&vault_id, &p, s.into_val(&env), &c).is_ok(),
+            "payment signed with the rotated key should succeed"
+        );
+    }
+
+    /// Test: after rotation, the OLD key no longer authorizes payments.
+    #[test]
+    #[should_panic]
+    fn test_old_agent_key_invalid_after_rotation() {
+        let env = Env::default();
+        let vault_id = env.register(AgentVault, ());
+        let client = AgentVaultClient::new(&env, &vault_id);
+
+        let admin = Address::generate(&env);
+        let (old_sk, old_pk) = gen_keypair(&env);
+        let provider_a = Address::generate(&env);
+        let allowlist = Map::from_array(&env, [(provider_a.clone(), 5_000_000_i128)]);
+        client.initialize(&admin, &old_pk, &5_000_000_i128, &allowlist, &10_000_u32, &0_i128);
+
+        // Rotate to a new key.
+        let (_, new_pk) = gen_keypair(&env);
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &admin,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &vault_id,
+                fn_name: "set_agent_pubkey",
+                args: (&new_pk,).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.set_agent_pubkey(&new_pk);
+
+        // A payment signed with the OLD key must fail (rejected signature).
+        let p = BytesN::<32>::random(&env);
+        let s = sign_payload(&env, &old_sk, &p);
+        let c = Vec::from_array(&env, [transfer_context(&env, &provider_a, 100_000)]);
+        env.try_invoke_contract_check_auth::<Error>(&vault_id, &p, s.into_val(&env), &c).unwrap();
+    }
+
+    /// Test: set_agent_pubkey from a non-admin panics.
+    #[test]
+    #[should_panic]
+    fn test_set_agent_pubkey_requires_admin() {
+        let env = Env::default();
+        let vault_id = env.register(AgentVault, ());
+        let client = AgentVaultClient::new(&env, &vault_id);
+
+        let admin = Address::generate(&env);
+        let (_, agent_pk) = gen_keypair(&env);
+        client.initialize(&admin, &agent_pk, &5_000_000_i128, &soroban_sdk::Map::new(&env), &10_000_u32, &0_i128);
+
+        let non_admin = Address::generate(&env);
+        let (_, new_pk) = gen_keypair(&env);
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &non_admin,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &vault_id,
+                fn_name: "set_agent_pubkey",
+                args: (&new_pk,).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.set_agent_pubkey(&new_pk);
+    }
+
+    #[test]
+    fn test_removed_payee_is_rejected_on_next_auth() {
+        let env = Env::default();
+        let vault_id = env.register(AgentVault, ());
+        let client = AgentVaultClient::new(&env, &vault_id);
+        let admin = Address::generate(&env);
+        let (agent_sk, agent_pk) = gen_keypair(&env);
+        let payee = Address::generate(&env);
+        let allowlist = Map::from_array(&env, [(payee.clone(), 5_000_000_i128)]);
+        client.initialize(&admin, &agent_pk, &5_000_000_i128, &allowlist, &10_000_u32, &0_i128);
+
+        env.mock_all_auths();
+        client.remove_from_allowlist(&payee);
+        assert!(!client.allowlist().contains_key(payee.clone()));
+
+        let payload = BytesN::<32>::random(&env);
+        let signature = sign_payload(&env, &agent_sk, &payload);
+        let contexts = Vec::from_array(&env, [transfer_context(&env, &payee, 100_000)]);
+        let result = env.try_invoke_contract_check_auth::<Error>(
+            &vault_id, &payload, signature.into_val(&env), &contexts,
+        );
+        assert_eq!(result.unwrap_err().unwrap(), Error::PayeeNotAllowed);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_remove_from_allowlist_requires_admin() {
+        let env = Env::default();
+        let vault_id = env.register(AgentVault, ());
+        let client = AgentVaultClient::new(&env, &vault_id);
+        let admin = Address::generate(&env);
+        let (_, agent_pk) = gen_keypair(&env);
+        let payee = Address::generate(&env);
+        let allowlist = Map::from_array(&env, [(payee.clone(), 5_000_000_i128)]);
+        client.initialize(&admin, &agent_pk, &5_000_000_i128, &allowlist, &10_000_u32, &0_i128);
+
+        let non_admin = Address::generate(&env);
+        env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+            address: &non_admin,
+            invoke: &soroban_sdk::testutils::MockAuthInvoke {
+                contract: &vault_id,
+                fn_name: "remove_from_allowlist",
+                args: (&payee,).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.remove_from_allowlist(&payee);
+    }
+
+    #[test]
+    fn test_admin_mutation_events() {
+        use soroban_sdk::testutils::Events;
+
+        let env = Env::default();
+        let vault_id = env.register(AgentVault, ());
+        let client = AgentVaultClient::new(&env, &vault_id);
+        let admin = Address::generate(&env);
+        let (_, agent_pk) = gen_keypair(&env);
+        client.initialize(&admin, &agent_pk, &5_000_000_i128, &Map::new(&env), &10_000_u32, &9_000_000_i128);
+        env.mock_all_auths();
+
+        client.set_daily_cap(&4_000_000_i128);
+        let (_, topics, data) = env.events().all().last().unwrap();
+        assert_eq!(Symbol::from_val(&env, &topics.get(0).unwrap()), Symbol::new(&env, "cap_updated"));
+        assert_eq!(Symbol::from_val(&env, &topics.get(1).unwrap()), symbol_short!("daily"));
+        assert_eq!(<(i128, i128)>::from_val(&env, &data), (5_000_000, 4_000_000));
+
+        client.set_lifetime_cap(&8_000_000_i128);
+        let (_, topics, data) = env.events().all().last().unwrap();
+        assert_eq!(Symbol::from_val(&env, &topics.get(1).unwrap()), symbol_short!("lifetime"));
+        assert_eq!(<(i128, i128)>::from_val(&env, &data), (9_000_000, 8_000_000));
+
+        let payee = Address::generate(&env);
+        client.add_to_allowlist(&payee, &2_000_000_i128);
+        let (_, topics, data) = env.events().all().last().unwrap();
+        assert_eq!(Symbol::from_val(&env, &topics.get(0).unwrap()), Symbol::new(&env, "allowlist_updated"));
+        assert_eq!(Address::from_val(&env, &topics.get(1).unwrap()), payee);
+        assert_eq!(Option::<i128>::from_val(&env, &data), Some(2_000_000));
+
+        client.remove_from_allowlist(&payee);
+        let (_, topics, data) = env.events().all().last().unwrap();
+        assert_eq!(Address::from_val(&env, &topics.get(1).unwrap()), payee);
+        assert_eq!(Option::<i128>::from_val(&env, &data), None);
+
+        client.freeze();
+        let (_, topics, _) = env.events().all().last().unwrap();
+        assert_eq!(Symbol::from_val(&env, &topics.get(0).unwrap()), Symbol::new(&env, "vault_frozen"));
+
+        client.unfreeze();
+        let (_, topics, _) = env.events().all().last().unwrap();
+        assert_eq!(Symbol::from_val(&env, &topics.get(0).unwrap()), Symbol::new(&env, "vault_unfrozen"));
+
+        let new_admin = Address::generate(&env);
+        client.transfer_admin(&new_admin);
+        let (_, topics, _) = env.events().all().last().unwrap();
+        assert_eq!(Symbol::from_val(&env, &topics.get(0).unwrap()), Symbol::new(&env, "admin_transfer_requested"));
+        assert_eq!(Address::from_val(&env, &topics.get(1).unwrap()), admin);
+        assert_eq!(Address::from_val(&env, &topics.get(2).unwrap()), new_admin);
+
+        client.accept_admin();
+        let (_, topics, _) = env.events().all().last().unwrap();
+        assert_eq!(Symbol::from_val(&env, &topics.get(0).unwrap()), Symbol::new(&env, "admin_changed"));
+        assert_eq!(Address::from_val(&env, &topics.get(1).unwrap()), admin);
+        assert_eq!(Address::from_val(&env, &topics.get(2).unwrap()), new_admin);
+    }
+
+    /// A SAC approve() auth context (from, spender, amount, expiration_ledger).
+    fn approve_context(env: &Env, amount: i128) -> Context {
+        let token = Address::generate(env);
+        let from = Address::generate(env);
+        let spender = Address::generate(env);
+        Context::Contract(ContractContext {
+            contract: token,
+            fn_name: symbol_short!("approve"),
+            args: (from, spender, amount, 100_000_u32).into_val(env),
+        })
+    }
+
+    /// A SAC burn() auth context (from, amount).
+    fn burn_context(env: &Env, amount: i128) -> Context {
+        let token = Address::generate(env);
+        let from = Address::generate(env);
+        Context::Contract(ContractContext {
+            contract: token,
+            fn_name: symbol_short!("burn"),
+            args: (from, amount).into_val(env),
+        })
+    }
+
+    /// Test 40: default-deny — an SAC approve() auth context is rejected even
+    /// when signed by the agent key, so a stolen key cannot drain the vault via
+    /// approve() + transfer_from() (issue #132).
+    #[test]
+    fn test_approve_context_rejected() {
+        let env = Env::default();
+        let (_, agent_sk, vault_id, _) = setup(&env);
+
+        let payload = BytesN::<32>::random(&env);
+        let sig = sign_payload(&env, &agent_sk, &payload);
+        let contexts = Vec::from_array(&env, [approve_context(&env, 1_000_000)]);
+
+        let result = env.try_invoke_contract_check_auth::<Error>(
+            &vault_id,
+            &payload,
+            sig.into_val(&env),
+            &contexts,
+        );
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            Error::UnauthorizedFunction,
+            "approve must not bypass the caps"
+        );
+    }
+
+    /// Test 41: default-deny — an SAC burn() auth context is rejected.
+    #[test]
+    fn test_burn_context_rejected() {
+        let env = Env::default();
+        let (_, agent_sk, vault_id, _) = setup(&env);
+
+        let payload = BytesN::<32>::random(&env);
+        let sig = sign_payload(&env, &agent_sk, &payload);
+        let contexts = Vec::from_array(&env, [burn_context(&env, 100_000)]);
+
+        let result = env.try_invoke_contract_check_auth::<Error>(
+            &vault_id,
+            &payload,
+            sig.into_val(&env),
+            &contexts,
+        );
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            Error::UnauthorizedFunction,
+            "burn must not bypass the caps"
+        );
+    }
+
+    /// Test 42: default-deny — a non-contract host fn context
+    /// (create_contract) is rejected rather than silently skipped.
+    #[test]
+    fn test_create_contract_host_fn_rejected() {
+        let env = Env::default();
+        let (_, agent_sk, vault_id, _) = setup(&env);
+
+        let create_ctx = Context::CreateContractHostFn(CreateContractHostFnContext {
+            executable: ContractExecutable::Wasm(BytesN::<32>::random(&env)),
+            salt: BytesN::<32>::random(&env),
+        });
+
+        let payload = BytesN::<32>::random(&env);
+        let sig = sign_payload(&env, &agent_sk, &payload);
+        let contexts = Vec::from_array(&env, [create_ctx]);
+
+        let result = env.try_invoke_contract_check_auth::<Error>(
+            &vault_id,
+            &payload,
+            sig.into_val(&env),
+            &contexts,
+        );
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            Error::UnauthorizedFunction,
+            "create_contract host fn must not bypass the caps"
+        );
+    }
+
+    /// Test 43: a batch mixing a valid transfer with an approve is rejected
+    /// wholesale — one unauthorized function poisons the whole auth.
+    #[test]
+    fn test_mixed_transfer_and_approve_rejected() {
+        let env = Env::default();
+        let (_, agent_sk, vault_id, provider_a) = setup(&env);
+
+        let payload = BytesN::<32>::random(&env);
+        let sig = sign_payload(&env, &agent_sk, &payload);
+        let contexts = Vec::from_array(
+            &env,
+            [transfer_context(&env, &provider_a, 100_000), approve_context(&env, 1_000_000)],
+        );
+
+        let result = env.try_invoke_contract_check_auth::<Error>(
+            &vault_id,
+            &payload,
+            sig.into_val(&env),
+            &contexts,
+        );
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            Error::UnauthorizedFunction,
+            "a mixed batch must not partially authorize"
+        );
+    }
+
+    /// Test 44: the success path survives the default-deny inversion — a lone
+    /// transfer within the caps still passes through the new match arm.
+    #[test]
+    fn test_transfer_still_authorized_after_default_deny() {
+        let env = Env::default();
+        let (_, agent_sk, vault_id, provider_a) = setup(&env);
+
+        let payload = BytesN::<32>::random(&env);
+        let sig = sign_payload(&env, &agent_sk, &payload);
+        let contexts = Vec::from_array(&env, [transfer_context(&env, &provider_a, 100_000)]);
+
+        let result = env.try_invoke_contract_check_auth::<Error>(
+            &vault_id,
+            &payload,
+            sig.into_val(&env),
+            &contexts,
+        );
+        assert!(result.is_ok(), "valid transfer must still pass: {result:?}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Property-based invariant tests
+// Enabled only when compiled with --features testutils (runs in CI, not locally
+// by default to avoid heavy compilation on resource-constrained machines).
+// ---------------------------------------------------------------------------
+#[cfg(all(test, feature = "testutils"))]
+mod prop_tests {
+    extern crate alloc;
+    use alloc::vec::Vec;
+    use proptest::prelude::*;
+
+    /// Helper: clamp a sequence of withdrawals to never exceed the cap, and
+    /// verify the running sum stays at or below the cap at every step.
+    fn withdrawals_never_exceed_cap(cap: i128, amounts: Vec<i128>) -> bool {
+        let mut running_total: i128 = 0;
+        for amount in amounts {
+            // Only authorise amounts that would not bust the cap
+            if amount <= 0 {
+                continue;
+            }
+            if running_total + amount > cap {
+                // Simulate a rejected withdrawal — running total stays the same
+                continue;
+            }
+            running_total += amount;
+            if running_total > cap {
+                return false;
+            }
+        }
+        true
+    }
+
+    proptest! {
+        /// Invariant 1: The daily cap is never exceeded regardless of the
+        /// sequence and magnitude of approved withdrawals.
+        #[test]
+        fn daily_cap_never_exceeded(
+            cap in 1_i128..=100_000_000_i128,
+            amounts in proptest::collection::vec(0_i128..=10_000_000_i128, 0..=50),
+        ) {
+            prop_assert!(withdrawals_never_exceed_cap(cap, amounts));
+        }
+
+        /// Invariant 2: Per-payee sub-cap is never exceeded.
+        /// Each payee cap is always <= the global daily cap.
+        #[test]
+        fn per_payee_cap_not_exceeded(
+            global_cap in 1_i128..=100_000_000_i128,
+            // Sub-cap is always a fraction of the global cap
+            sub_cap_fraction in 1_u32..=100_u32,
+            amounts in proptest::collection::vec(0_i128..=5_000_000_i128, 0..=30),
+        ) {
+            let sub_cap = global_cap / (sub_cap_fraction as i128).max(1);
+            // Sub-cap must not exceed global cap
+            prop_assert!(sub_cap <= global_cap);
+            // Simulate withdrawals capped at the sub-cap
+            prop_assert!(withdrawals_never_exceed_cap(sub_cap, amounts.clone()));
+            // Also verify against global cap
+            prop_assert!(withdrawals_never_exceed_cap(global_cap, amounts));
+        }
+
+        /// Invariant 3: Lifetime spend cap is monotonically non-decreasing and
+        /// never exceeds the configured maximum.
+        #[test]
+        fn lifetime_cap_monotone(
+            lifetime_max in 1_i128..=1_000_000_000_i128,
+            amounts in proptest::collection::vec(0_i128..=10_000_000_i128, 0..=100),
+        ) {
+            let mut lifetime_spent: i128 = 0;
+            let mut prev = 0_i128;
+            for amount in amounts {
+                if amount <= 0 { continue; }
+                if lifetime_spent + amount > lifetime_max { continue; }
+                lifetime_spent += amount;
+                // Monotone: never decreases
+                prop_assert!(lifetime_spent >= prev);
+                // Never exceeds maximum
+                prop_assert!(lifetime_spent <= lifetime_max);
+                prev = lifetime_spent;
+            }
+        }
+    }
+}

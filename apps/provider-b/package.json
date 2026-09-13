@@ -1,0 +1,28 @@
+{
+  "name": "provider-b",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "wrangler deploy --dry-run --outdir dist",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "tsx --test \"src/**/*.test.ts\"",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@rojojo/rojojo": "workspace:*",
+    "@stellar/mpp": "^0.4.0",
+    "@supabase/supabase-js": "^2.47.0",
+    "hono": "^4.12.23"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250109.0",
+    "@types/node": "^20.0.0",
+    "ajv": "^8.17.1",
+    "ajv-formats": "^3.0.1",
+    "tsx": "^4.22.3",
+    "typescript": "^5.4.5",
+    "wrangler": "^4.118.0"
+  }
+}

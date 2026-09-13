@@ -1,0 +1,132 @@
+﻿name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  contract-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust
+        # Pinned: Rust 1.97 rejects a transmute in the transitive ethnum crate
+        # (E0512). 1.94.x compiles the soroban-sdk deps cleanly.
+        uses: dtolnay/rust-toolchain@75be91dd2711b583df57c31d0873b4145c89f1d9 # branch 1.94.1
+      - name: Run contract tests
+        run: cargo test --manifest-path contracts/agent-vault/Cargo.toml
+      - name: Run contract proptest invariants
+        run: cargo test --manifest-path contracts/agent-vault/Cargo.toml --features testutils
+
+  sdk-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: pnpm/action-setup@a3252b78c470c02df07e9d59298aecedc3ccdd6d # v3.0.0
+        with:
+          version: 9
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: 'pnpm'
+      - name: Install dependencies
+        run: pnpm install
+      - name: Build nulth-sdk (required by sdk at runtime)
+        run: pnpm --filter @rojojo/nulth-sdk build
+      - name: Run SDK tests
+        run: pnpm --filter @rojojo/rojojo test
+      - name: Run MCP server tests
+        run: pnpm --filter @rojojo/mcp-server test
+      # The provider manifest tests import @rojojo/rojojo/schema, which
+      # resolves to the SDK's built dist/. The SDK's own tests run from source,
+      # so nothing above this point builds it.
+      - name: Build sdk (provider tests import its built schema)
+        run: pnpm --filter @rojojo/rojojo build
+      - name: Run provider-a tests
+        run: pnpm --filter provider-a test
+      - name: Run provider-b tests
+        run: pnpm --filter provider-b test
+      - name: Run web tests
+        run: pnpm --filter web test
+
+  app-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: pnpm/action-setup@a3252b78c470c02df07e9d59298aecedc3ccdd6d # v3.0.0
+        with:
+          version: 9
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: 'pnpm'
+      - name: Install dependencies
+        run: pnpm install
+      - name: Build nulth-sdk first (workspace dependency)
+        run: pnpm --filter @rojojo/nulth-sdk build
+      - name: Build sdk (depends on nulth-sdk types)
+        run: pnpm --filter @rojojo/rojojo build
+      - name: Build remaining packages
+        run: pnpm -r --filter '!@rojojo/nulth-sdk' --filter '!@rojojo/rojojo' build
+
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: pnpm/action-setup@a3252b78c470c02df07e9d59298aecedc3ccdd6d # v3.0.0
+        with:
+          version: 9
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: 'pnpm'
+      - name: Install dependencies
+        run: pnpm install
+      - name: Build SDK packages first (required by downstream typechecks)
+        run: |
+          pnpm --filter @rojojo/nulth-sdk build
+          pnpm --filter @rojojo/rojojo build
+      - name: Typecheck all packages
+        run: pnpm -r typecheck
+
+  actionlint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Run actionlint
+        uses: reviewdog/action-actionlint@f00ad0691526c10be4021a91b2510f0a769b14d0 # v1.68.0
+        with:
+          fail_level: error
+      - name: Guard release.yml permissions
+        # release.yml has twice regressed to missing the permissions that make
+        # Changesets and the release watchdog work (#255, fixed in 8f3d82b).
+        # Fail fast if either goes missing again.
+        # Matches only real YAML keys, anchored to start-of-line indentation.
+        # A substring grep also matches the explanatory comments above the
+        # permissions block in release.yml, so it would pass even with the
+        # block deleted.
+        run: |
+          for perm in "contents" "pull-requests"; do
+            if ! grep -qE "^[[:space:]]+${perm}:[[:space:]]*write[[:space:]]*$" .github/workflows/release.yml; then
+              echo "::error file=.github/workflows/release.yml::missing required permission '${perm}: write'"
+              exit 1
+            fi
+          done
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: pnpm/action-setup@a3252b78c470c02df07e9d59298aecedc3ccdd6d # v3.0.0
+        with:
+          version: 9
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: 'pnpm'
+      - name: Install dependencies
+        run: pnpm install
+      - name: Lint
+        run: pnpm -r lint

@@ -1,0 +1,92 @@
+/**
+ * Nulth ZK vault integration tests — no live chain or x402 settlement.
+ */
+
+import assert from 'node:assert/strict'
+import {
+  assertNulthVaultManifest,
+  prepareNulthSigner,
+} from '../NulthVault.js'
+import type { RojojoManifest } from '../../types.js'
+import { RojojoManifestError } from '../../errors.js'
+import { decodeAuthSignature } from '../NulthVault.js'
+
+const NULTH = 'CAX5IDLC2XHGQSEA2YN3LPLZ7EXLMRXYX3HFJGKFXS6B7OQXBKWO44LT'
+const PAYEE = 'GDHLJWBM6Z2Y4KF6Z4JAFIUUO2KAXAJ6MAIUK2XMGBQ7ZUUZ7HFPW2BK'
+
+const baseManifest: RojojoManifest = {
+  rojojo: '1.0',
+  name: 'Nulth Test Provider',
+  description: 'ZK vault test',
+  modes: ['x402'],
+  network: 'testnet',
+  asset: 'USDC',
+  asset_contract: 'CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA',
+  payee: PAYEE,
+  pricing: {
+    x402: {
+      amount: '0.001',
+      per: 'request',
+      facilitator: 'https://channels.openzeppelin.com/x402/testnet',
+    },
+  },
+  endpoints: { price: { method: 'GET', path: '/price' } },
+  tags: ['test'],
+  vault: 'nulth',
+  nulth_account: NULTH,
+}
+
+assertNulthVaultManifest(baseManifest, NULTH)
+
+assert.throws(
+  () => assertNulthVaultManifest({ ...baseManifest, vault: 'agent-vault' }, NULTH),
+  RojojoManifestError,
+)
+
+const vault = {
+  mode: 'nulth' as const,
+  nulthAccount: NULTH,
+  witnessSecret: 'witness',
+  allowedPayees: [PAYEE],
+  dailyCapUsdc: '1.00',
+}
+
+const { signer } = await prepareNulthSigner(
+  vault,
+  baseManifest,
+  'x402',
+  'testnet',
+  100_000,
+)
+assert.equal(signer.address, NULTH)
+
+const signed = await signer.signAuthEntry(
+  Buffer.from('route-dock-auth-entry').toString('base64'),
+)
+const decoded = decodeAuthSignature(signed.signedAuthEntry)
+assert.equal(decoded.proof.version, 1)
+assert.doesNotMatch(decoded.proof.publicInputs.payeeHash, new RegExp(PAYEE.slice(4)))
+assert.notEqual(decoded.proof.publicInputs.capCommitment, '1.00')
+assert.notEqual(decoded.proof.publicInputs.allowlistCommitment, PAYEE)
+
+console.log('✓ Nulth ZK vault SDK integration PASSED')
+
+{
+  const vault = {
+    mode: 'nulth' as const,
+    nulthAccount: NULTH,
+    witnessSecret: 'witness',
+    allowedPayees: [PAYEE],
+    dailyCapUsdc: '1.00',
+  }
+
+  const manifest: RojojoManifest = { ...baseManifest, network: 'mainnet' }
+
+  await assert.rejects(
+    () => prepareNulthSigner(vault, manifest, 'x402', 'mainnet', 100_000),
+    (err: unknown) =>
+      err instanceof RojojoManifestError &&
+      /mock prover/i.test(err.message),
+  )
+  console.log('✓ mainnet guard rejects mock prover')
+}

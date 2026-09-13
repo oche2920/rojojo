@@ -1,0 +1,28 @@
+﻿{
+  "name": "rojojo",
+  "private": true,
+  "scripts": {
+    "build": "pnpm -r build",
+    "dev": "pnpm -r --parallel dev",
+    "typecheck": "pnpm -r typecheck",
+    "lint": "pnpm -r lint",
+    "stress:test": "pnpm exec tsx scripts/stress_test.ts",
+    "version": "changeset version",
+    "release": "pnpm run release:build && changeset publish",
+    "release:build": "pnpm --filter @rojojo/nulth-sdk build && pnpm --filter @rojojo/rojojo build && pnpm --filter @rojojo/mcp-server build",
+    "verify": "bash scripts/verify.sh",
+    "prepare": "git config core.hooksPath .githooks 2>/dev/null || true"
+  },
+  "devDependencies": {
+    "@changesets/changelog-github": "^0.7.0",
+    "tsx": "^4.22.4",
+    "typescript": "^5.4.5"
+  },
+  "dependencies": {
+    "@changesets/cli": "^2.31.0"
+  },
+  "packageManager": "pnpm@9.15.9",
+  "engines": {
+    "node": ">=22"
+  }
+}

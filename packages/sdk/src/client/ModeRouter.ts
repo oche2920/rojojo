@@ -1,0 +1,454 @@
+import { Validator, type Schema } from '@cfworker/json-schema'
+import type { RojojoManifest, PaymentMode } from '../types.js'
+import {
+  RojojoError,
+  RojojoManifestError,
+  RojojoManifestTimeoutError,
+  RojojoManifestSunsetError,
+  RojojoNoSupportedModeError,
+  RojojoPolicyRejectError,
+  RojojoClientVersionError,
+  httpStatusToError,
+  wrapFetchError,
+} from '../errors.js'
+import { withRetry, type RetryPolicy } from '../internal/retry.js'
+import schema from '../schemas/rojojo.schema.json' assert { type: 'json' }
+import pkg from '../../package.json' assert { type: 'json' }
+import { verifyManifestSignature } from '../manifest/sign.js'
+
+const validator = new Validator(schema as unknown as Schema, '7')
+
+const SDK_VERSION = pkg.version as string
+
+function parseMajorMinor(version: string): [number, number] {
+  const parts = version.split('.')
+  return [Number.parseInt(parts[0] ?? '0', 10), Number.parseInt(parts[1] ?? '0', 10)]
+}
+
+function isVersionBelow(a: string, b: string): boolean {
+  const [aMajor, aMinor] = parseMajorMinor(a)
+  const [bMajor, bMinor] = parseMajorMinor(b)
+  return aMajor < bMajor || (aMajor === bMajor && aMinor < bMinor)
+}
+
+function assertClientVersionSupported(manifest: RojojoManifest, baseUrl: string): void {
+  const minVersion = manifest.min_client_version
+  if (minVersion && isVersionBelow(SDK_VERSION, minVersion)) {
+    throw new RojojoClientVersionError(
+      `SDK version ${SDK_VERSION} is below the minimum required version ${minVersion} for provider at ${baseUrl}. Please upgrade the SDK.`,
+    )
+  }
+}
+
+function assertManifestActive(manifest: RojojoManifest, baseUrl: string): void {
+  const sunsetAt = manifest.sunset_at
+  if (!sunsetAt) return
+
+  const sunsetTime = Date.parse(sunsetAt)
+  if (!Number.isFinite(sunsetTime)) {
+    throw new RojojoManifestError(
+      `Manifest at ${baseUrl} contains an invalid sunset_at timestamp: ${sunsetAt}`,
+    )
+  }
+
+  if (sunsetTime <= Date.now()) {
+    throw new RojojoManifestSunsetError(
+      `Manifest for provider at ${baseUrl} sunset at ${sunsetAt} and can no longer be used`,
+    )
+  }
+}
+
+/**
+ * Validate semantic constraints for manifest fields beyond JSON schema syntax.
+ * Enforces that all keys in `latency_hints` must be a subset of declared `regions`.
+ */
+export function assertManifestValid(manifest: RojojoManifest, baseUrl?: string): void {
+  const context = baseUrl ? ` at ${baseUrl}` : ''
+  if (manifest.latency_hints !== undefined) {
+    if (!Array.isArray(manifest.regions) || manifest.regions.length === 0) {
+      throw new RojojoManifestError(
+        `Invalid manifest${context}: latency_hints defined without declaring regions`,
+      )
+    }
+    const regionSet = new Set(manifest.regions)
+    for (const region of Object.keys(manifest.latency_hints)) {
+      if (!regionSet.has(region)) {
+        throw new RojojoManifestError(
+          `Invalid manifest${context}: latency_hints key '${region}' is not declared in regions (${manifest.regions.join(', ')})`,
+        )
+      }
+    }
+  }
+}
+
+interface CacheEntry {
+  manifest: RojojoManifest
+  fetchedAt: number
+  expiresAt: number
+}
+
+const CACHE_TTL_MS = 60_000
+const DEFAULT_MANIFEST_CACHE_MAX_SIZE = 512
+const DEFAULT_MANIFEST_TIMEOUT_MS = 5_000
+
+/**
+ * Simple LRU cache backed by Map's insertion-order guarantee.
+ * Bounds memory for long-running agents that contact many unique endpoints.
+ */
+class LruCache<K, V> {
+  private map = new Map<K, V>()
+
+  constructor(private maxSize: number) {}
+
+  get(key: K): V | undefined {
+    if (!this.map.has(key)) return undefined
+    const value = this.map.get(key) as V
+    this.map.delete(key)
+    this.map.set(key, value)
+    return value
+  }
+
+  set(key: K, value: V): void {
+    if (this.map.has(key)) {
+      this.map.delete(key)
+    } else if (this.map.size >= this.maxSize) {
+      const oldestKey = this.map.keys().next().value
+      if (oldestKey !== undefined) {
+        this.map.delete(oldestKey)
+      }
+    }
+    this.map.set(key, value)
+  }
+
+  setMaxSize(maxSize: number): void {
+    this.maxSize = maxSize
+    while (this.map.size > this.maxSize) {
+      const oldestKey = this.map.keys().next().value
+      if (oldestKey === undefined) break
+      this.map.delete(oldestKey)
+    }
+  }
+
+  delete(key: K): void {
+    this.map.delete(key)
+  }
+}
+
+/** In-memory manifest cache keyed by base URL, bounded to avoid unbounded heap growth. */
+const manifestCache = new LruCache<string, CacheEntry>(DEFAULT_MANIFEST_CACHE_MAX_SIZE)
+
+/**
+ * Override the manifest cache's max size (default 512). Affects the shared,
+ * process-wide cache used by all RojojoClient instances.
+ */
+export function configureManifestCache(maxSize: number): void {
+  if (!Number.isInteger(maxSize) || maxSize <= 0) {
+    throw new RojojoManifestError('Invalid manifest cache size: ' + maxSize)
+  }
+  manifestCache.setMaxSize(maxSize)
+}
+
+/**
+ * Evict a provider's cached manifest immediately, forcing the next
+ * `fetchManifest(baseUrl)` to re-fetch and re-validate it. Use when a
+ * provider signals that their manifest changed (e.g. after a config update
+ * or a failed payment due to a mode change) so the next request does not
+ * keep routing on a stale cached copy for the remainder of the TTL.
+ *
+ * The cache is keyed by base URL as passed to `fetchManifest` — callers that
+ * pass a full URL (e.g. `RojojoClient.invalidateManifest`) must normalize
+ * to the origin before calling this.
+ */
+export function invalidateManifest(baseUrl: string): void {
+  manifestCache.delete(baseUrl)
+}
+
+/**
+ * Per-entry freshness from response headers, per RFC 9111:
+ * `Cache-Control: max-age` wins over `Expires`, and both win over the
+ * default TTL. Missing or unparseable directives fall back to the default
+ * TTL (60s). `max-age=0` yields an immediately-stale entry, disabling
+ * caching for that response.
+ */
+function ttlFromHeaders(headers: Headers, now: number): number {
+  const cacheControl = headers.get('cache-control')
+  if (cacheControl) {
+    const maxAge = /max-age=(\d+)/i.exec(cacheControl)
+    if (maxAge) {
+      return Number.parseInt(maxAge[1]!, 10) * 1000
+    }
+  }
+  const expires = headers.get('expires')
+  if (expires) {
+    const expiresTime = Date.parse(expires)
+    if (Number.isFinite(expiresTime)) {
+      return expiresTime - now
+    }
+  }
+  return CACHE_TTL_MS
+}
+
+export type RojojoLogger = (message: string) => void
+
+export interface ModeSelectOptions {
+  /** Force mpp-session if the provider supports it */
+  sustained?: boolean
+  session?: boolean
+  /**
+   * Preferred streaming transport for sustained sessions. When 'websocket',
+   * the mpp-session-ws variant is preferred when the provider advertises it;
+   * when 'sse' (or omitted), the classic mpp-session mode is preferred.
+   * Either transport falls back to the other session variant when the
+   * preferred one is not advertised.
+   */
+  transport?: 'sse' | 'websocket'
+  /** Prefer the lowest-cost supported per-request mode when set to 'cost'. */
+  optimize?: 'cost'
+  /** Optional maximum acceptable per-request amount for cost-based selection. */
+  budget_per_request?: string
+  /**
+   * Override mode selection and use this specific mode.
+   * Throws RojojoNoSupportedModeError if the provider does not support it.
+   */
+  forceMode?: PaymentMode
+  /** Structured logger for mode selection events. Defaults to no-op. */
+  logger?: RojojoLogger
+}
+
+/**
+ * Fetch, validate, and cache a Rojojo manifest from `baseUrl`.
+ *
+ * `expectedPayee`, when provided, is the out-of-band trust anchor for the
+ * manifest (e.g. the account this provider registered on-chain): the fetched
+ * manifest's `payee` must equal it or `RojojoSignatureError` is thrown.
+ * Callers that obtained a payee from a registry/pinned allowlist MUST pass it;
+ * without it the self-signed signature alone proves nothing about who served
+ * the manifest.
+ */
+export async function fetchManifest(
+  baseUrl: string,
+  retryPolicy?: RetryPolicy,
+  manifestTimeoutMs = DEFAULT_MANIFEST_TIMEOUT_MS,
+  expectedPayee?: string,
+): Promise<RojojoManifest> {
+  const cached = manifestCache.get(baseUrl)
+  if (cached && Date.now() < cached.expiresAt) {
+    // Re-assert the trust anchor even on cache hits: the manifest content is
+    // immutable, but `expectedPayee` is per-caller, so a caller with a
+    // different anchor must still have the binding enforced.
+    verifyManifestSignature(cached.manifest, expectedPayee)
+    assertClientVersionSupported(cached.manifest, baseUrl)
+    assertManifestValid(cached.manifest, baseUrl)
+    assertManifestActive(cached.manifest, baseUrl)
+    return cached.manifest
+  }
+
+  const url = baseUrl.replace(/\/$/, '') + '/.well-known/rojojo.json'
+
+  return withRetry(async () => {
+    let raw: unknown
+    let expiresAt = 0
+    try {
+      const resp = await fetch(url, { signal: AbortSignal.timeout(manifestTimeoutMs) })
+      if (!resp.ok) {
+        if (resp.status >= 500 || resp.status === 429 || resp.status === 503) {
+          throw httpStatusToError(
+            `Manifest fetch failed: HTTP ${resp.status} from ${url}`,
+            resp.status,
+            resp,
+          )
+        }
+        throw new RojojoManifestError(
+          `Manifest fetch failed: HTTP ${resp.status} from ${url}`,
+        )
+      }
+      const now = Date.now()
+      expiresAt = now + ttlFromHeaders(resp.headers, now)
+      raw = await resp.json()
+    } catch (err) {
+      if (err instanceof Error && (err.name === 'TimeoutError' || err.name === 'AbortError')) {
+        throw new RojojoManifestTimeoutError(
+          `Manifest fetch timed out after ${manifestTimeoutMs}ms from ${url}`,
+          { cause: err },
+        )
+      }
+      if (err instanceof RojojoError) throw err
+      throw wrapFetchError(err, `Manifest fetch error from ${url}`)
+    }
+
+    const result = validator.validate(raw)
+    if (!result.valid) {
+      const msgs = result.errors.map(err => err.error).join('; ')
+      throw new RojojoManifestError(`Invalid manifest at ${url}: ${msgs}`)
+    }
+
+    const manifest = raw as unknown as RojojoManifest
+    assertManifestValid(manifest, baseUrl)
+    verifyManifestSignature(manifest, expectedPayee)
+    assertClientVersionSupported(manifest, baseUrl)
+    assertManifestActive(manifest, baseUrl)
+    manifestCache.set(baseUrl, { manifest, fetchedAt: Date.now(), expiresAt })
+    return manifest
+  }, retryPolicy)
+}
+
+interface ModeSelection {
+  mode: PaymentMode
+  reason?: 'cost-optimized'
+}
+
+function selectFromModes(
+  modes: PaymentMode[],
+  manifest: RojojoManifest,
+  options: ModeSelectOptions,
+): ModeSelection | undefined {
+  if (options.sustained || options.session) {
+    // Prefer the session variant matching the requested transport, falling
+    // back to the other session variant when the preferred one is missing.
+    if (options.transport === 'websocket') {
+      if (modes.includes('mpp-session-ws')) return { mode: 'mpp-session-ws' }
+      if (modes.includes('mpp-session')) return { mode: 'mpp-session' }
+    } else {
+      if (modes.includes('mpp-session')) return { mode: 'mpp-session' }
+      if (modes.includes('mpp-session-ws')) return { mode: 'mpp-session-ws' }
+    }
+  }
+
+  if (options.optimize === 'cost') {
+    const candidates = (['x402', 'mpp-charge'] as Array<'x402' | 'mpp-charge'>)
+      .filter((mode) => modes.includes(mode))
+      .map((mode) => {
+        const pricing = manifest.pricing[mode]
+        const amount = pricing?.amount
+        const parsedAmount = typeof amount === 'string' ? Number.parseFloat(amount) : Number.NaN
+        return {
+          mode: mode as PaymentMode,
+          amount: Number.isFinite(parsedAmount) ? parsedAmount : Number.POSITIVE_INFINITY,
+        }
+      })
+      .filter((candidate) => Number.isFinite(candidate.amount))
+
+    if (candidates.length > 0) {
+      const budget = options.budget_per_request
+        ? Number.parseFloat(options.budget_per_request)
+        : Number.POSITIVE_INFINITY
+      const affordableCandidates = Number.isFinite(budget)
+        ? candidates.filter((candidate) => candidate.amount <= budget)
+        : candidates
+
+      const cheapestCandidate = [...affordableCandidates].sort((a, b) => a.amount - b.amount)[0]
+      if (cheapestCandidate) {
+        return { mode: cheapestCandidate.mode, reason: 'cost-optimized' }
+      }
+
+      // All candidates exceed the caller's budget ceiling — error instead of
+      // silently falling through to an over-budget mode.
+      if (options.budget_per_request !== undefined) {
+        throw new RojojoPolicyRejectError('budget_per_request_exceeded')
+      }
+    }
+  }
+
+  if (modes.includes('mpp-charge')) return { mode: 'mpp-charge' }
+  if (modes.includes('x402')) return { mode: 'x402' }
+  return undefined
+}
+
+function logSelection(
+  manifest: RojojoManifest,
+  selection: ModeSelection,
+  log: RojojoLogger,
+  deprecated: boolean,
+): void {
+  const reason = selection.reason ? ` (${selection.reason})` : ''
+  if (deprecated) {
+    log(
+      `[Rojojo] WARNING: ${manifest.name} → ${selection.mode}${reason}; selected deprecated mode because no active supported mode is available`,
+    )
+    return
+  }
+  log(`[Rojojo] ${manifest.name} → ${selection.mode}${reason}`)
+}
+
+/**
+ * Deterministic mode selection per Section 6.3 of ROJOJO_MASTER.md.
+ *
+ * Active modes are always considered before modes listed in `deprecated_modes`.
+ * Deprecated modes remain usable as a compatibility fallback and produce a
+ * logger warning when selected. An explicit forceMode remains authoritative,
+ * but also warns when the forced mode is deprecated.
+ */
+export function selectMode(
+  manifest: RojojoManifest,
+  options: ModeSelectOptions = {},
+): PaymentMode {
+  const modes = manifest.modes
+  const log = options.logger ?? (() => {})
+  const deprecatedSet = new Set(manifest.deprecated_modes ?? [])
+
+  if (options.forceMode) {
+    if (!modes.includes(options.forceMode)) {
+      throw new RojojoNoSupportedModeError(
+        `Provider does not support forced mode: ${options.forceMode} (available: ${modes.join(', ')})`,
+      )
+    }
+    if (deprecatedSet.has(options.forceMode)) {
+      log(
+        `[Rojojo] WARNING: ${manifest.name} → ${options.forceMode} (forced); selected mode is deprecated`,
+      )
+    } else {
+      log(`[Rojojo] ${manifest.name} → ${options.forceMode} (forced)`)
+    }
+    return options.forceMode
+  }
+
+  const activeModes = modes.filter((mode) => !deprecatedSet.has(mode))
+  const deprecatedModes = modes.filter((mode) => deprecatedSet.has(mode))
+
+  const activeSelection = selectFromModes(activeModes, manifest, options)
+  if (activeSelection) {
+    logSelection(manifest, activeSelection, log, false)
+    return activeSelection.mode
+  }
+
+  const deprecatedSelection = selectFromModes(deprecatedModes, manifest, options)
+  if (deprecatedSelection) {
+    logSelection(manifest, deprecatedSelection, log, true)
+    return deprecatedSelection.mode
+  }
+
+  throw new RojojoNoSupportedModeError(
+    `No supported payment mode found in manifest (modes: ${modes.join(', ')})`,
+  )
+}
+
+/**
+ * Rank a list of provider manifests by estimated p50 round-trip latency for a given target region.
+ * Manifests declaring latency_hints for the target region are sorted ascending by latency (lowest first).
+ * Manifests that list the region in `regions` without an explicit latency hint come next.
+ * Manifests not advertising the target region come last.
+ */
+export function rankProvidersByLatency(
+  manifests: RojojoManifest[],
+  targetRegion: string,
+): RojojoManifest[] {
+  return [...manifests].sort((a, b) => {
+    const latA = a.latency_hints?.[targetRegion]
+    const latB = b.latency_hints?.[targetRegion]
+    const inRegionsA = a.regions?.includes(targetRegion) ?? false
+    const inRegionsB = b.regions?.includes(targetRegion) ?? false
+
+    // Both have numeric latency hints
+    if (latA !== undefined && latB !== undefined) {
+      return latA - latB
+    }
+    if (latA !== undefined) return -1
+    if (latB !== undefined) return 1
+
+    // Neither has explicit latency hint, check regions inclusion
+    if (inRegionsA && !inRegionsB) return -1
+    if (!inRegionsA && inRegionsB) return 1
+
+    return 0
+  })
+}

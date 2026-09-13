@@ -1,0 +1,802 @@
+import type { MiddlewareHandler } from 'hono'
+import { Keypair } from '@stellar/stellar-sdk'
+import { ExactStellarScheme as ExactStellarFacilitatorScheme } from '@x402/stellar/exact/facilitator'
+import { ExactStellarScheme as ExactStellarServerScheme } from '@x402/stellar/exact/server'
+import { HTTPFacilitatorClient, x402ResourceServer } from '@x402/core/server'
+import { createEd25519Signer } from '@x402/stellar'
+import {
+  decodePaymentSignatureHeader,
+  encodePaymentRequiredHeader,
+  encodePaymentResponseHeader,
+} from '@x402/core/http'
+import type { Network as X402Network } from '@x402/core/types'
+import { stellar as mppCharge } from '@stellar/mpp/charge/server'
+import { stellar as mppChannel, close as channelClose, Store } from '@stellar/mpp/channel/server'
+import { Mppx } from 'mppx/server'
+import type { RojojoManifest, PaymentMode } from '../types.js'
+import { signManifest } from '../manifest/sign.js'
+import { resolvePayee } from './payee.js'
+import { usdcToUnits } from '../internal/usdc.js'
+import { extractPayerAddress } from './payer.js'
+import { channelAuthorizer, withTypedChannelErrors } from './mppCompatibility.js'
+import type { Method } from 'mppx'
+import { type ChannelStore, type OrphanedSessionInfo, isVoucherStoreValue } from './MppSessionHandler.js'
+import { base64ToUtf8, hexToBytes } from './encoding.js'
+import {
+  InMemorySeenTxStore,
+  paymentIdempotencyKey,
+  type SeenTxStore,
+} from './SeenTxStore.js'
+
+type Network = 'testnet' | 'mainnet'
+
+const CAIP2: Record<Network, X402Network> = {
+  testnet: 'stellar:testnet',
+  mainnet: 'stellar:pubnet',
+}
+
+const OZ_FACILITATOR_URL = 'https://channels.openzeppelin.com/x402'
+
+export interface RojojoHonoOptions {
+  modes: PaymentMode[]
+  pricing: {
+    x402?: string
+    'mpp-charge'?: string
+    'mpp-session'?: { rate: string; channelFactory: string }
+    /** WebSocket transport variant of mpp-session — same channel, WS streaming */
+    'mpp-session-ws'?: { rate: string; channelFactory: string }
+  }
+  asset: string
+  assetContract: string
+  payee: string
+  network: Network
+  payeeSecretKey: string
+  facilitatorApiKey?: string
+  commitmentPublicKey?: string
+  manifest: RojojoManifest
+  onSettled?: (txHash: string, amount: string, mode: string, payer: string | null) => Promise<void>
+  onSessionOpen?: (channelId: string, payer: string | null) => Promise<void>
+  onVoucher?: (channelId: string, voucherIndex: number, cumulativeAmount: string, signature: string) => Promise<void>
+  onCallbackError?: (err: unknown, cbName: string) => void
+  /**
+   * Called when an mpp-session connection aborts or goes idle before a clean
+   * close. Persist the session as `closing` for the SessionReconciler.
+   */
+  onOrphaned?: (channelId: string, info: OrphanedSessionInfo) => Promise<void>
+  /** Idle timeout (ms) after which an mpp-session is flagged orphaned. */
+  idleTimeoutMs?: number
+  /**
+   * Idempotency store guarding against duplicate settlement when an agent
+   * retries the same payment. Defaults to a per-handler in-memory store.
+   */
+  seenTxStore?: SeenTxStore
+  /**
+   * Persistent store backing mpp-session channel state and handler state.
+   * Defaults to an in-memory store per handler; supply a durable store (e.g.
+   * Durable Object storage) so voucher tracking survives isolate eviction.
+   */
+  sessionStore?: Store.Store
+}
+
+function createX402HonoHandler(opts: RojojoHonoOptions): MiddlewareHandler {
+  const caip2 = CAIP2[opts.network]
+  const payeeKeypair = Keypair.fromSecret(opts.payeeSecretKey)
+  const signer = createEd25519Signer(opts.payeeSecretKey, caip2)
+  const x402Price = opts.pricing.x402!
+  const seenTxStore = opts.seenTxStore ?? new InMemorySeenTxStore()
+
+  const useOzFacilitator = opts.network === 'mainnet' && opts.facilitatorApiKey
+
+  const localFacilitator = new ExactStellarFacilitatorScheme([signer], {
+    areFeesSponsored: true,
+  })
+
+  let ozServer: x402ResourceServer | null = null
+  if (useOzFacilitator) {
+    const apiKey = opts.facilitatorApiKey!
+    const facilitator = new HTTPFacilitatorClient({
+      url: OZ_FACILITATOR_URL,
+      createAuthHeaders: async () => ({
+        verify: { Authorization: `Bearer ${apiKey}` },
+        settle: { Authorization: `Bearer ${apiKey}` },
+        supported: { Authorization: `Bearer ${apiKey}` },
+      }),
+    })
+    ozServer = new x402ResourceServer(facilitator)
+    ozServer.register(caip2, new ExactStellarServerScheme())
+  }
+
+  const amountInBaseUnits = String(usdcToUnits(x402Price))
+  const requirements = {
+    scheme: 'exact' as const,
+    network: caip2,
+    asset: opts.assetContract,
+    amount: amountInBaseUnits,
+    payTo: resolvePayee(opts.manifest, 'x402'),
+    maxTimeoutSeconds: 60,
+    extra: {
+      areFeesSponsored: true,
+      ...(useOzFacilitator ? {} : { facilitatorAddresses: [payeeKeypair.publicKey()] }),
+    },
+  }
+
+  return async (c, next) => {
+    try {
+      const paymentHeader = c.req.header('payment-signature') ?? c.req.header('x-payment')
+
+      if (!paymentHeader) {
+        if (ozServer) {
+          const resourceInfo = {
+            url: c.req.url,
+            description: opts.manifest.name,
+          }
+          const paymentRequired = await ozServer.createPaymentRequiredResponse(
+            [requirements],
+            resourceInfo,
+          )
+          c.header('X-Payment-Requirements', encodePaymentRequiredHeader(paymentRequired))
+          return c.json({ error: 'Payment Required' }, 402)
+        } else {
+          const x402Response = {
+            x402Version: 2,
+            resource: { url: c.req.url, description: opts.manifest.name },
+            accepts: [requirements],
+          }
+          c.header('X-Payment-Requirements', encodePaymentRequiredHeader(x402Response))
+          return c.json({ error: 'Payment Required' }, 402)
+        }
+      }
+
+      // Idempotency: a retry of an already-settled payment replays the cached
+      // settlement response instead of settling (and billing) a second time.
+      const idempotencyKey = await paymentIdempotencyKey((name) => c.req.header(name))
+      if (idempotencyKey) {
+        const cached = await seenTxStore.get(idempotencyKey)
+        if (cached) {
+          if (cached.headers) {
+            for (const [k, val] of Object.entries(cached.headers)) {
+              c.header(k, val)
+            }
+          }
+          await next()
+          return
+        }
+      }
+
+      const payload = decodePaymentSignatureHeader(paymentHeader)
+      let txHash: string | null = null
+      let paymentResponseHeader: string | undefined
+      // Extract payer public key from the x402 Stellar payload.
+      let payerAddress: string | null = null
+      try {
+        const creds = (
+          payload as unknown as {
+            authorization?: { credentials?: Array<{ publicKey?: string }> }
+          }
+        ).authorization?.credentials
+        const key = Array.isArray(creds) ? creds[0]?.publicKey : undefined
+        payerAddress = extractPayerAddress(key)
+      } catch {
+        // non-fatal
+      }
+
+      if (ozServer) {
+        const settleResult = await ozServer.settlePayment(payload, requirements)
+        txHash = (settleResult as { transaction?: string }).transaction ?? null
+        if (settleResult) {
+          paymentResponseHeader = encodePaymentResponseHeader(
+            settleResult as Parameters<typeof encodePaymentResponseHeader>[0],
+          )
+          c.header('X-Payment-Response', paymentResponseHeader)
+        }
+      } else {
+        const verifyResult = await localFacilitator.verify(
+          payload as Parameters<typeof localFacilitator.verify>[0],
+          requirements,
+        )
+        if (!verifyResult.isValid) {
+          return c.json(
+            {
+              error: 'Payment verification failed',
+              reason: (verifyResult as { invalidReason?: string }).invalidReason,
+            },
+            401,
+          )
+        }
+        const settleResult = await localFacilitator.settle(
+          payload as Parameters<typeof localFacilitator.settle>[0],
+          requirements,
+        )
+        txHash = (settleResult as { transaction?: string }).transaction ?? null
+        if (settleResult) {
+          paymentResponseHeader = encodePaymentResponseHeader(
+            settleResult as Parameters<typeof encodePaymentResponseHeader>[0],
+          )
+          c.header('X-Payment-Response', paymentResponseHeader)
+        }
+      }
+
+      // Record the settlement so a retry of this exact payment is deduped.
+      if (idempotencyKey) {
+        const headers: Record<string, string> = {}
+        if (paymentResponseHeader) headers['X-Payment-Response'] = paymentResponseHeader
+        await seenTxStore.set(idempotencyKey, { txHash, headers })
+      }
+
+      if (txHash && opts.onSettled) {
+        Promise.resolve().then(() => opts.onSettled!(txHash!, x402Price, 'x402', payerAddress)).catch(err => {
+          console.error('[x402] onSettled callback error:', err)
+          opts.onCallbackError?.(err, 'onSettled')
+        })
+      }
+
+      await next()
+    } catch (err) {
+      console.error('[x402] Settlement error:', err)
+      return c.json({ error: 'Payment settlement failed' }, 500)
+    }
+  }
+}
+
+function createMppChargeHonoHandler(opts: RojojoHonoOptions): MiddlewareHandler {
+  const networkId = CAIP2[opts.network] as 'stellar:testnet' | 'stellar:pubnet'
+  const chargePrice = opts.pricing['mpp-charge']!
+  const recipient = resolvePayee(opts.manifest, 'mpp-charge')
+  const seenTxStore = opts.seenTxStore ?? new InMemorySeenTxStore()
+
+  const mppx = Mppx.create({
+    secretKey: opts.payeeSecretKey,
+    methods: [
+      mppCharge({
+        recipient,
+        currency: opts.assetContract,
+        network: networkId,
+        feePayer: { envelopeSigner: opts.payeeSecretKey },
+      }),
+    ],
+  })
+
+  return async (c, next) => {
+    try {
+      // Extract payer public key from the mppx Payment authorization header.
+      let payerAddress: string | null = null
+      try {
+        const authHeader = c.req.header('authorization')
+        if (authHeader?.startsWith('Payment ')) {
+          const credPart = authHeader
+            .replace(/^Payment\s+/, '')
+            .split(',')
+            .find((p) => p.trim().startsWith('credential='))
+          if (credPart) {
+            const b64 = credPart.split('=').slice(1).join('=').replace(/^"|"$/g, '')
+            const credJson = base64ToUtf8(b64)
+            const cred = JSON.parse(credJson) as {
+              sender?: string
+              payload?: { sender?: string; from?: string }
+            }
+            const key = cred.sender ?? cred.payload?.sender ?? cred.payload?.from
+            payerAddress = extractPayerAddress(key)
+          }
+        }
+      } catch {
+        // non-fatal
+      }
+
+      // Idempotency: a retry of an already-settled charge replays the cached
+      // receipt headers instead of settling (and billing) a second time.
+       const idempotencyKey = await paymentIdempotencyKey((name) => c.req.header(name))
+      if (idempotencyKey) {
+        const cached = await seenTxStore.get(idempotencyKey)
+        if (cached) {
+          if (cached.headers) {
+            for (const [k, val] of Object.entries(cached.headers)) {
+              c.header(k, val)
+            }
+          }
+          await next()
+          return
+        }
+      }
+
+      const handler = (
+        mppx as unknown as {
+          'stellar/charge': (o: {
+            amount: string
+            currency: string
+            recipient: string
+            description?: string
+          }) => (input: globalThis.Request) => Promise<{
+            status: 402 | 200
+            challenge?: globalThis.Response
+            withReceipt?: (r: globalThis.Response) => globalThis.Response
+          }>
+        }
+      )['stellar/charge']
+
+      const result = await handler({
+        amount: chargePrice,
+        currency: opts.assetContract,
+        recipient,
+        description: opts.manifest.name,
+      })(c.req.raw)
+
+      if (result.status === 402) {
+        const challenge = result.challenge!
+        const headers: Record<string, string> = {}
+        challenge.headers.forEach((v: string, k: string) => { headers[k] = v })
+        return new Response(await challenge.text(), { status: 402, headers })
+      }
+
+      const receipt = result.withReceipt!(new Response(''))
+      const receiptHeaders: Record<string, string> = {}
+      receipt.headers.forEach((v: string, k: string) => {
+        c.header(k, v)
+        receiptHeaders[k] = v
+      })
+
+      const receiptHeader = receipt.headers.get('payment-receipt')
+      let reference: string | undefined
+      if (receiptHeader) {
+        try {
+          const parsed = JSON.parse(base64ToUtf8(receiptHeader)) as { reference?: string }
+          reference = parsed.reference
+        } catch {
+          // non-fatal — receipt is opaque/unparseable
+        }
+      }
+
+      // Record the settlement so a retry of this exact charge is deduped.
+      if (idempotencyKey) {
+        await seenTxStore.set(idempotencyKey, {
+          txHash: reference ?? null,
+          headers: receiptHeaders,
+        })
+      }
+
+      if (reference && opts.onSettled) {
+        Promise.resolve().then(() => opts.onSettled!(reference!, chargePrice, 'mpp-charge', payerAddress)).catch(err => {
+          console.error('[mpp-charge] onSettled callback error:', err)
+          opts.onCallbackError?.(err, 'onSettled')
+        })
+      }
+
+      await next()
+    } catch (err) {
+      throw err
+    }
+  }
+}
+
+/**
+ * Context key set by the mpp-session-ws middleware after a request's payment
+ * credential has been verified, so the app's WebSocket upgrade route can
+ * refuse to upgrade unauthenticated handshakes.
+ */
+export const MPP_SESSION_WS_VERIFIED = 'rojojo.mppSessionWs.verified'
+
+/**
+ * True when the rojojoHono mpp-session-ws middleware verified the
+ * handshake request's Payment credential (see {@link MPP_SESSION_WS_VERIFIED}).
+ * WebSocket upgrade routes should refuse to upgrade when this is false.
+ */
+export function mppSessionWsVerified(c: { get: (key: string) => unknown }): boolean {
+  return c.get(MPP_SESSION_WS_VERIFIED) === true
+}
+
+/** Contexts the shared session state is invoked with (subset of hono's Context). */
+interface DeleteContext {
+  req: { json(): Promise<unknown> }
+  json: (data: unknown) => Response
+}
+interface AuthContext {
+  req: { header(name: string): string | undefined }
+}
+interface SignalContext {
+  req: { raw: { signal?: AbortSignal } }
+}
+
+/**
+ * Mutable per-channel session state shared by the mpp-session and
+ * mpp-session-ws handlers. Extracted so a provider advertising both transports
+ * (same channel factory) verifies vouchers against ONE store and closes the
+ * channel with the combined cumulative — two independent stores would let a
+ * DELETE close see only the vouchers of whichever handler received it.
+ */
+interface MppSessionHandlerState {
+  /** mppx server instance (channel method) used for voucher verification. */
+  mppx: unknown
+  /** Handle a DELETE channel-close request; returns the HTTP response. */
+  handleDelete(c: DeleteContext): Promise<Response>
+  /** Extract payer + latest signature from a Payment authorization header. */
+  extractPayer(c: AuthContext): void
+  /** Arm the connection-closed orphan guard (idempotent). */
+  armAbortGuard(c: SignalContext): void
+}
+
+function createMppSessionHandlerState(
+  opts: RojojoHonoOptions,
+  sessionPricing: { rate: string; channelFactory: string },
+  reportMode: 'mpp-session' | 'mpp-session-ws',
+): MppSessionHandlerState {
+  const networkId = CAIP2[opts.network] as 'stellar:testnet' | 'stellar:pubnet'
+  const payeeKeypair = Keypair.fromSecret(opts.payeeSecretKey)
+  const cumulativeKey = `stellar:channel:cumulative:${sessionPricing.channelFactory}`
+
+  const innerStore = opts.sessionStore ?? Store.memory()
+  let lastCumulativeAmount = 0n
+  let voucherCount = 0
+  let sessionOpened = false
+  let lastSignatureHex = ''
+  let sessionPayerAddress: string | null = null
+  let idleTimer: ReturnType<typeof setTimeout> | null = null
+  let settledCleanly = false
+  let abortListenerArmed = false
+
+  function clearIdleTimer(): void {
+    if (idleTimer) {
+      clearTimeout(idleTimer)
+      idleTimer = null
+    }
+  }
+
+  function armIdleTimer(): void {
+    if (!opts.idleTimeoutMs) return
+    clearIdleTimer()
+    idleTimer = setTimeout(() => {
+      void flagOrphan('idle-timeout')
+    }, opts.idleTimeoutMs)
+    // `unref` exists on Node's Timeout but not the Web `number` handle — call it
+    // defensively so the timer never keeps a Node process alive.
+    const maybeUnref = idleTimer as unknown as { unref?: () => void }
+    if (typeof maybeUnref.unref === 'function') maybeUnref.unref()
+  }
+
+  // Flag an open-but-unsettled session for the reconciler. Idempotent.
+  async function flagOrphan(reason: 'connection-closed' | 'idle-timeout'): Promise<void> {
+    if (!sessionOpened || settledCleanly) return
+    sessionOpened = false
+    abortListenerArmed = false
+    clearIdleTimer()
+
+    const cumulativeAmount = (Number(lastCumulativeAmount) / 1e7).toFixed(7)
+    if (opts.onOrphaned) {
+      try {
+        await opts.onOrphaned(sessionPricing.channelFactory, {
+          cumulativeAmount,
+          lastSignature: lastSignatureHex,
+          voucherCount,
+          reason,
+        })
+      } catch (err) {
+        console.error('[mpp-session] onOrphaned handler failed:', err)
+      }
+    }
+  }
+
+  const wrappedStore: ChannelStore = {
+    async get(key: string) { return innerStore.get(key) },
+    async put(key: string, value: unknown) {
+      await innerStore.put(key, value)
+      if (key === cumulativeKey && isVoucherStoreValue(value)) {
+        lastCumulativeAmount = BigInt(value.amount)
+        voucherCount++
+        // Voucher activity — this session is alive again.
+        settledCleanly = false
+        armIdleTimer()
+
+        if (!sessionOpened) {
+          sessionOpened = true
+          if (opts.onSessionOpen) {
+            Promise.resolve()
+              .then(() => opts.onSessionOpen!(sessionPricing.channelFactory, sessionPayerAddress))
+              .catch((err) => {
+                console.error('[mpp-session] onSessionOpen callback error:', err)
+                opts.onCallbackError?.(err, 'onSessionOpen')
+              })
+          }
+        }
+
+        if (opts.onVoucher) {
+          const humanAmount = (Number(lastCumulativeAmount) / 1e7).toFixed(7)
+          Promise.resolve().then(() => opts.onVoucher!(sessionPricing.channelFactory, voucherCount, humanAmount, lastSignatureHex)).catch(err => {
+            console.error('[mpp-session] onVoucher callback error:', err)
+            opts.onCallbackError?.(err, 'onVoucher')
+          })
+        }
+      }
+    },
+    async delete(key: string) { return innerStore.delete(key) },
+    async update(key: string, fn: (prev: unknown) => unknown) {
+      const storeWithUpdate = innerStore as Partial<ChannelStore>
+      if (typeof storeWithUpdate.update === 'function') {
+        return storeWithUpdate.update(key, fn)
+      }
+      throw new Error('Store does not support atomic update operations')
+    },
+  }
+
+  const mppx = Mppx.create({
+    secretKey: opts.payeeSecretKey,
+    methods: [
+      withTypedChannelErrors(mppChannel({
+        channel: sessionPricing.channelFactory,
+        commitmentKey: opts.commitmentPublicKey!,
+        network: networkId,
+        store: wrappedStore,
+        sourceAccount: payeeKeypair.publicKey(),
+        feePayer: channelAuthorizer(payeeKeypair),
+      }) as Method.AnyServer),
+    ],
+  })
+
+  return {
+    mppx,
+
+    async handleDelete(c: DeleteContext): Promise<Response> {
+      let body: { amount?: string; signature?: string } | undefined
+      try {
+        body = await c.req.json() as { amount?: string; signature?: string }
+      } catch {
+        // empty or non-JSON body
+      }
+
+      const bodyAmount = body?.amount ? BigInt(body.amount) : 0n
+      let closeAmount: bigint
+      let closeSig: string
+      if (bodyAmount > lastCumulativeAmount) {
+        closeAmount = bodyAmount
+        closeSig = body?.signature ?? lastSignatureHex
+      } else {
+        closeAmount = lastCumulativeAmount
+        // Prefer the provider's own tracked signature. Fall back to the
+        // client's only when it signs the same amount and the provider never
+        // captured one (voucher reached the mppx store without a Payment
+        // credential) — otherwise a close for a genuinely tracked amount
+        // no-ops and the session is never flagged for recovery.
+        closeSig =
+          lastSignatureHex ||
+          (bodyAmount === lastCumulativeAmount ? body?.signature ?? '' : '')
+      }
+
+      if (closeAmount > 0n && closeSig) {
+        const closeTxHash = await channelClose({
+          channel: sessionPricing.channelFactory,
+          amount: closeAmount,
+          signature: hexToBytes(closeSig),
+          feePayer: channelAuthorizer(payeeKeypair),
+          network: networkId,
+        })
+
+        // Clean close — suppress any orphan flagging for this session. Only
+        // after the close broadcast succeeded: if channelClose throws, the
+        // orphan state must stay armed so the reconciler can still recover
+        // this channel. Matches MppSessionHandler.ts ordering.
+        settledCleanly = true
+        clearIdleTimer()
+
+        if (opts.onSettled) {
+          const totalPaid = (Number(closeAmount) / 1e7).toFixed(7)
+          Promise.resolve().then(() => opts.onSettled!(closeTxHash, totalPaid, reportMode, sessionPayerAddress)).catch(err => {
+            console.error(`[mpp-session] onSettled callback error:`, err)
+            opts.onCallbackError?.(err, 'onSettled')
+          })
+        }
+
+        sessionOpened = false
+        voucherCount = 0
+        lastCumulativeAmount = 0n
+        sessionPayerAddress = null
+        abortListenerArmed = false
+
+        return c.json({ closeTxHash })
+      }
+
+      return c.json({ closeTxHash: null, message: 'no vouchers received' })
+    },
+
+    extractPayer(c: AuthContext): void {
+      const authHeader = c.req.header('authorization')
+      if (!authHeader?.startsWith('Payment ')) return
+      try {
+        const credB64 = authHeader
+          .replace(/^Payment\s+/, '')
+          .split(',')
+          .find((p) => p.trim().startsWith('credential='))
+        if (credB64) {
+          const credJson = base64ToUtf8(
+            credB64.split('=').slice(1).join('=').replace(/^"|"$/g, ''),
+          )
+          const cred = JSON.parse(credJson) as {
+            sender?: string
+            payload?: { signature?: string; sender?: string; from?: string }
+          }
+          if (cred.payload?.signature) {
+            lastSignatureHex = cred.payload.signature
+          }
+          if (!sessionPayerAddress) {
+            const key = cred.sender ?? cred.payload?.sender ?? cred.payload?.from
+            sessionPayerAddress = extractPayerAddress(key)
+          }
+        }
+      } catch {
+        // non-fatal
+      }
+    },
+
+    armAbortGuard(c: SignalContext): void {
+      // Payment verified. The Workers/edge runtime exposes connection teardown
+      // via the request's AbortSignal — use it (in place of Node's
+      // `req.on('close')`) so a client crash mid-session flags the channel for
+      // the reconciler instead of leaking state.
+      const signal = c.req.raw.signal
+      if (signal && !abortListenerArmed) {
+        abortListenerArmed = true
+        signal.addEventListener(
+          'abort',
+          () => { void flagOrphan('connection-closed') },
+          { once: true },
+        )
+      }
+    },
+  }
+}
+
+function createMppSessionHonoHandler(
+  opts: RojojoHonoOptions,
+  config: { mode: 'mpp-session' | 'mpp-session-ws' },
+  state: MppSessionHandlerState,
+): MiddlewareHandler {
+  const sessionPricing = opts.pricing[config.mode]!
+  return async (c, next) => {
+    try {
+      if (c.req.method === 'DELETE') {
+        return state.handleDelete(c as unknown as DeleteContext)
+      }
+
+      state.extractPayer(c as unknown as AuthContext)
+
+      const result = await (
+        state.mppx as unknown as {
+          channel: (o: { amount: string; description?: string }) => (
+            r: globalThis.Request,
+          ) => Promise<{
+            status: number
+            challenge?: globalThis.Response
+            withReceipt?: (r: globalThis.Response) => globalThis.Response
+          }>
+        }
+      ).channel({
+        amount: sessionPricing.rate,
+        description: opts.manifest.name,
+      })(c.req.raw)
+
+      if (result.status === 402) {
+        const challenge = result.challenge!
+        const headers: Record<string, string> = {}
+        challenge.headers.forEach((v: string, k: string) => { headers[k] = v })
+        return new Response(await challenge.text(), { status: 402, headers })
+      }
+
+      state.armAbortGuard(c as unknown as SignalContext)
+
+      // mpp-session-ws: the verified request is a WebSocket handshake, so hand
+      // control to the app's upgrade route (it checks MPP_SESSION_WS_VERIFIED)
+      // instead of letting the data route answer with a 200 body.
+      if (config.mode === 'mpp-session-ws' && isWebSocketUpgradeRequest(c)) {
+        c.set(MPP_SESSION_WS_VERIFIED, true)
+        await next()
+        return
+      }
+
+      await next()
+    } catch (err) {
+      throw err
+    }
+  }
+}
+
+/** True when the request is a WebSocket upgrade handshake. */
+function isWebSocketUpgradeRequest(c: {
+  req: { header: (name: string) => string | undefined }
+}): boolean {
+  return (c.req.header('upgrade') ?? '').toLowerCase() === 'websocket'
+}
+
+/**
+ * Hono middleware factory for Rojojo provider endpoints.
+ *
+ * **Workers-safe entry point.** This module uses only Web-standard APIs
+ * (`atob`/`TextDecoder` via {@link base64ToUtf8}, {@link hexToBytes}, and the
+ * request `AbortSignal`) and runs on Cloudflare Workers, Bun, Deno Deploy, and
+ * any Hono deployment target. The Express `rojojo()` middleware
+ * (`@rojojo/rojojo/provider`) is Node.js-only — it relies on Node's
+ * `Buffer` and `req.on('close')`.
+ *
+ * Exposes the same configuration surface as the Express `rojojo()` middleware.
+ *
+ * @example
+ * ```ts
+ * import { rojojoHono } from '@rojojo/sdk/provider/hono'
+ *
+ * app.use('/price', rojojoHono({
+ *   modes: ['x402', 'mpp-charge'],
+ *   pricing: { x402: '0.001', 'mpp-charge': '0.0008' },
+ *   ...
+ * }))
+ * ```
+ */
+export function rojojoHono(opts: RojojoHonoOptions): MiddlewareHandler {
+  const handlers: MiddlewareHandler[] = []
+  const signedManifest = signManifest(opts.manifest, opts.payeeSecretKey)
+
+  if (opts.modes.includes('x402') && opts.pricing.x402) {
+    handlers.push(createX402HonoHandler({ ...opts, manifest: signedManifest }))
+  }
+
+  if (opts.modes.includes('mpp-charge') && opts.pricing['mpp-charge']) {
+    handlers.push(createMppChargeHonoHandler({ ...opts, manifest: signedManifest }))
+  }
+
+  // Session modes (mpp-session, mpp-session-ws) share one channel store so a
+  // provider advertising both transports verifies vouchers against the same
+  // cumulative state and a DELETE close sees the combined total.
+  const sessionModes = (['mpp-session', 'mpp-session-ws'] as const).filter(
+    (mode) => opts.modes.includes(mode) && !!opts.pricing[mode],
+  )
+  const primarySessionMode = sessionModes[0]
+  if (primarySessionMode) {
+    if (!opts.commitmentPublicKey) {
+      throw new Error('rojojoHono: mpp-session/mpp-session-ws mode requires commitmentPublicKey')
+    }
+    const sessionPricing = opts.pricing[primarySessionMode]!
+    const sharedState = createMppSessionHandlerState(opts, sessionPricing, primarySessionMode)
+    for (const mode of sessionModes) {
+      handlers.push(
+        createMppSessionHonoHandler({ ...opts, manifest: signedManifest }, { mode }, sharedState),
+      )
+    }
+  }
+
+  return async (c, next) => {
+    if (c.req.path === '/.well-known/rojojo.json') {
+      return c.json(signedManifest)
+    }
+
+    if (handlers.length === 0) {
+      await next()
+      return
+    }
+
+    const hasX402Header = !!(
+      c.req.header('payment-signature') || c.req.header('x-payment')
+    )
+    const prefersX402 = c.req.header('x-preferred-mode') === 'x402'
+
+    const handler =
+      hasX402Header || prefersX402 ? handlers[0] : handlers[handlers.length - 1]
+
+    if (!handler) {
+      await next()
+      return
+    }
+
+    return handler(c, next)
+  }
+}
+
+export { registerProvider, type RegisterProviderOptions } from './registerProvider.js'
+export { signManifest } from '../manifest/sign.js'
+export {
+  SupabaseSeenTxStore,
+} from '../store/SupabaseSeenTxStore.js'
+export {
+  InMemorySeenTxStore,
+  type SeenTxStore,
+  type SettlementRecord,
+} from './SeenTxStore.js'
+export {
+  reconcileAbandonedSessions,
+  runStartupReconciliation,
+  type SessionReconcilerOptions,
+  type ReconciliationStats,
+} from './SessionReconciler.js'

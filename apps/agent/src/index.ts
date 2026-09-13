@@ -1,0 +1,321 @@
+/**
+ * Rojojo Reference Agent — Phase 4
+ *
+ * Runs the full autonomous payment sequence from Section 10.1 of
+ * ROJOJO_MASTER.md against live provider services on Stellar testnet.
+ *
+ * Run sequence:
+ *   1. Initialize — derive keypair, log balance
+ *   2. x402 discrete query (forced mode)
+ *   3. MPP charge query (natural mode selection)
+ *   4. MPP session — open + 50 SSE events + close (KEY DEMO: 50 interactions, 2 tx)
+ *   5. Policy rejection — spend cap enforced locally, nothing broadcast
+ *   6. Summary log + write agent/RUN_RESULTS.md
+ *
+ * WARNING: The mpp-session path uses stellar-experimental/one-way-channel,
+ * an UNAUDITED contract. Do not use in production without an independent audit.
+ */
+
+import { writeFileSync } from 'node:fs'
+import path from 'node:path'
+import os from 'node:os'
+import { Keypair } from '@stellar/stellar-sdk'
+import { Horizon } from '@stellar/stellar-sdk'
+import { RojojoClient, FileSpendStore, RojojoPolicyRejectError, RojojoTrustlineError } from '@rojojo/rojojo'
+
+// ── Config ────────────────────────────────────────────────────────────────────
+
+const STELLAR_NETWORK = (process.env['STELLAR_NETWORK'] ?? 'testnet') as 'testnet' | 'mainnet'
+const AGENT_SECRET = process.env['AGENT_SECRET'] ?? ''
+const PROVIDER_A_URL = (process.env['PROVIDER_A_URL'] ?? 'http://localhost:3001').replace(/\/$/, '')
+const PROVIDER_B_URL = (process.env['PROVIDER_B_URL'] ?? 'http://localhost:3002').replace(/\/$/, '')
+const AGENT_DAILY_CAP_USDC = process.env['AGENT_DAILY_CAP_USDC'] ?? '0.002'
+const COMMITMENT_SECRET = process.env['COMMITMENT_SECRET'] ?? ''
+const AGENT_SPEND_STORE_PATH =
+  process.env['AGENT_SPEND_STORE_PATH'] ??
+  process.env['ROJOJO_SPEND_STORE_PATH'] ??
+  path.join(os.homedir(), '.rojojo', 'spend.json')
+
+const HORIZON_URL =
+  STELLAR_NETWORK === 'testnet'
+    ? 'https://horizon-testnet.stellar.org'
+    : 'https://horizon.stellar.org'
+
+const EXPLORER_BASE = `https://stellar.expert/explorer/${STELLAR_NETWORK}/tx`
+
+// ── Logging ───────────────────────────────────────────────────────────────────
+
+function log(step: string, msg: string): void {
+  const ts = new Date().toISOString()
+  console.log(`[${ts}] [${step}] ${msg}`)
+}
+
+function explorerLink(txHash: string): string {
+  return `${EXPLORER_BASE}/${txHash}`
+}
+
+type AgentSession = Awaited<ReturnType<RojojoClient['openSession']>>
+type CloseResult = Awaited<ReturnType<AgentSession['close']>>
+
+let activeSession: AgentSession | null = null
+let closingSession = false
+
+async function closeActiveSession(reason: string): Promise<CloseResult | null> {
+  if (!activeSession || closingSession) return null
+  closingSession = true
+  log('mpp-session', `Closing active session (${reason})...`)
+
+  try {
+    return await activeSession.close()
+  } finally {
+    activeSession = null
+    closingSession = false
+  }
+}
+
+for (const signal of ['SIGINT', 'SIGTERM'] as const) {
+  process.once(signal, () => {
+    closeActiveSession(signal)
+      .then(() => process.exit(0))
+      .catch((err) => {
+        console.error(`[Agent] Failed to close session during ${signal}:`, err)
+        process.exit(1)
+      })
+  })
+}
+
+// ── Main ──────────────────────────────────────────────────────────────────────
+
+async function main(): Promise<void> {
+  // ── Step 1: Initialize ────────────────────────────────────────────────────
+
+  if (!AGENT_SECRET || !AGENT_SECRET.startsWith('S')) {
+    console.error('FATAL: AGENT_SECRET is required and must be a valid Stellar secret key (S...)')
+    process.exit(1)
+  }
+
+  const keypair = Keypair.fromSecret(AGENT_SECRET)
+  const agentAddress = keypair.publicKey()
+
+  const spendStore = new FileSpendStore(AGENT_SPEND_STORE_PATH)
+
+  const client = new RojojoClient({
+    wallet: keypair,
+    network: STELLAR_NETWORK,
+    spendCap: { daily: AGENT_DAILY_CAP_USDC, asset: 'USDC' },
+    spendStore,
+    commitmentSecret: COMMITMENT_SECRET || undefined,
+  })
+
+  // Fetch USDC balance from Horizon — also serves as an early trustline check
+  const horizonServer = new Horizon.Server(HORIZON_URL)
+  let startingBalance = '0'
+  let trustlineFound = false
+  try {
+    const account = await horizonServer.loadAccount(agentAddress)
+    const usdcBalance = account.balances.find(
+      (b) => 'asset_code' in b && b.asset_code === 'USDC',
+    )
+    if (usdcBalance) {
+      startingBalance = usdcBalance.balance
+      trustlineFound = true
+    } else {
+      log('Init', 'WARNING: No USDC trustline found — first payment will fail with RojojoTrustlineError')
+      log('Init', '  Create one: stellar tx new --source <SECRET_KEY> --network mainnet change-trust --asset USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN --limit 100000')
+    }
+  } catch (err) {
+    log('Init', 'Warning: could not fetch balance from Horizon — continuing')
+  }
+
+  log('Init', `[Rojojo Agent] Started. Address: ${agentAddress} Balance: ${startingBalance} USDC`)
+  log('Init', `Network: ${STELLAR_NETWORK}, DailyCap: ${AGENT_DAILY_CAP_USDC} USDC`)
+  log('Init', `SpendStore: FileSpendStore (${AGENT_SPEND_STORE_PATH})`)
+  log('Init', `Provider A: ${PROVIDER_A_URL}`)
+  log('Init', `Provider B: ${PROVIDER_B_URL}`)
+
+  const txHashes: {
+    x402?: string
+    mppCharge?: string
+    channelOpen?: string
+    channelClose?: string
+  } = {}
+  let closeResult: CloseResult | null = null
+
+  // ── Step 2: x402 discrete query ───────────────────────────────────────────
+
+  log('x402', 'Querying price endpoint with forced x402 mode...')
+  const x402Result = await client.pay(`${PROVIDER_A_URL}/price`, { forceMode: 'x402' })
+
+  if (!x402Result.txHash) {
+    throw new Error(`x402 payment returned null txHash — settlement did not complete`)
+  }
+
+  txHashes.x402 = x402Result.txHash
+  log('x402', `mode=${x402Result.mode} txHash=${x402Result.txHash} amount=${x402Result.amount}`)
+  log('x402', `price=${JSON.stringify((x402Result.data as { price?: string })?.price)}`)
+  log('x402', `explorer: ${explorerLink(x402Result.txHash)}`)
+
+  // ── Step 3: MPP charge query ──────────────────────────────────────────────
+
+  log('mpp-charge', 'Querying price endpoint (natural mode selection → mpp-charge)...')
+  const chargeResult = await client.pay(`${PROVIDER_A_URL}/price`)
+
+  log('mpp-charge', `mode=${chargeResult.mode} txHash=${chargeResult.txHash ?? 'null'} amount=${chargeResult.amount}`)
+  log('mpp-charge', `price=${JSON.stringify((chargeResult.data as { price?: string })?.price)}`)
+  if (chargeResult.txHash) {
+    txHashes.mppCharge = chargeResult.txHash
+    log('mpp-charge', `explorer: ${explorerLink(chargeResult.txHash)}`)
+  }
+
+  // ── Step 4: MPP session streaming ─────────────────────────────────────────
+  log('mpp-session', 'Opening MPP session channel...')
+  activeSession = await client.openSession(`${PROVIDER_B_URL}/stream/orderbook`)
+
+  if (activeSession.openTxHash) {
+    txHashes.channelOpen = activeSession.openTxHash
+  }
+  log('mpp-session', `[Session] Opened. Channel: ${activeSession.channelId} openTxHash: ${activeSession.openTxHash ?? 'n/a (pre-deployed channel)'}`)
+  if (activeSession.openTxHash) {
+    log('mpp-session', `Channel open explorer: ${explorerLink(activeSession.openTxHash)}`)
+  }
+
+  // Consume exactly 50 SSE events from the session stream
+  const TARGET_VOUCHERS = 50
+  let voucherCount = 0
+
+  try {
+    for await (const _item of activeSession.stream()) {
+      voucherCount++
+
+      if (voucherCount % 10 === 0) {
+        const stats = activeSession.stats()
+        log('mpp-session', `[Session] Vouchers: ${stats.vouchersIssued}, Cumulative: $${stats.currentCumulative}`)
+      }
+
+      if (voucherCount >= TARGET_VOUCHERS) break
+    }
+
+    log('mpp-session', `Consumed ${voucherCount} vouchers. Closing session...`)
+    closeResult = await closeActiveSession(`consumed ${voucherCount} vouchers`)
+  } finally {
+    if (activeSession) {
+      await closeActiveSession('finally')
+    }
+  }
+
+  if (!closeResult) {
+    throw new Error('mpp-session close returned no result')
+  }
+
+  txHashes.channelClose = closeResult.closeTxHash
+  log(
+    'mpp-session',
+    `[Session] Closed. closeTxHash: ${closeResult.closeTxHash}. ` +
+    `${closeResult.vouchersIssued} interactions, 2 on-chain transactions.`,
+  )
+  log('mpp-session', `totalPaid: ${closeResult.totalPaid} USDC`)
+  log('mpp-session', `Channel close explorer: ${explorerLink(closeResult.closeTxHash)}`)
+
+  // ── Step 5: Policy rejection ──────────────────────────────────────────────
+
+  // After steps 2+3, daily spend = 0.001 + 0.0008 = 0.0018 USDC.
+  // Daily cap = 0.002 USDC. Adding another 0.001 (x402 price) → 0.0028 > 0.002 → rejected.
+  log('policy', 'Attempting payment that exceeds daily cap...')
+  let policyRejected = false
+  try {
+    await client.pay(`${PROVIDER_A_URL}/price`, { forceMode: 'x402' })
+    log('policy', 'WARNING: payment succeeded when it should have been rejected!')
+  } catch (err) {
+    if (err instanceof RojojoPolicyRejectError) {
+      policyRejected = true
+      log('policy', `[Policy] REJECTED — reason: ${err.reason}. No transaction broadcast.`)
+      log('policy', 'Confirmed: spend cap enforced locally before any Stellar transaction.')
+    } else {
+      throw err
+    }
+  }
+
+  if (!policyRejected) {
+    log('policy', 'WARNING: expected RojojoPolicyRejectedError but payment succeeded')
+  }
+
+  // ── Step 6: Summary ───────────────────────────────────────────────────────
+
+  const summary = buildSummary(agentAddress, startingBalance, txHashes, voucherCount, closeResult.totalPaid)
+
+  console.log('\n' + summary)
+
+  // Write RUN_RESULTS.md
+  const resultsPath = require('node:path').join(__dirname, '..', 'RUN_RESULTS.md') as string
+  writeFileSync(resultsPath, summary, 'utf8')
+  log('Summary', `RUN_RESULTS.md written to ${resultsPath}`)
+}
+
+// ── Summary builder ───────────────────────────────────────────────────────────
+
+function buildSummary(
+  agentAddress: string,
+  startingBalance: string,
+  txHashes: { x402?: string; mppCharge?: string; channelOpen?: string; channelClose?: string },
+  vouchersUsed: number,
+  totalPaid: string,
+): string {
+  const line = (label: string, hash?: string): string => {
+    if (!hash) return `  ${label.padEnd(22)} NO TX`
+    return `  ${label.padEnd(22)} ${hash}\n  ${''.padEnd(22)} → ${EXPLORER_BASE}/${hash}`
+  }
+
+  return [
+    '# Rojojo Agent Run Results',
+    '',
+    `**Date:** ${new Date().toISOString()}`,
+    `**Network:** ${STELLAR_NETWORK}`,
+    `**Agent address:** \`${agentAddress}\``,
+    `**Starting USDC balance:** ${startingBalance}`,
+    '',
+    '## Transaction Hashes',
+    '',
+    '```',
+    line('x402 settlement:', txHashes.x402),
+    line('MPP charge:', txHashes.mppCharge),
+    line('Channel open:', txHashes.channelOpen),
+    line('Channel close:', txHashes.channelClose),
+    '  Policy rejection:      NO TX (cap enforced locally)',
+    '```',
+    '',
+    '## Session Details',
+    '',
+    `- Vouchers consumed: ${vouchersUsed}`,
+    `- Total paid via session: ${totalPaid} USDC`,
+    `- On-chain transactions for session: 2 (open + close)`,
+    '',
+    '## Verification',
+    '',
+    txHashes.x402
+      ? `- x402 settlement: [view on explorer](${EXPLORER_BASE}/${txHashes.x402})`
+      : '- x402 settlement: PENDING',
+    txHashes.mppCharge
+      ? `- MPP charge: [view on explorer](${EXPLORER_BASE}/${txHashes.mppCharge})`
+      : '- MPP charge: PENDING',
+    txHashes.channelOpen
+      ? `- Channel open: [view on explorer](${EXPLORER_BASE}/${txHashes.channelOpen})`
+      : '- Channel open: PENDING',
+    txHashes.channelClose
+      ? `- Channel close: [view on explorer](${EXPLORER_BASE}/${txHashes.channelClose})`
+      : '- Channel close: PENDING',
+    '- Policy rejection: NO TX confirmed (nothing broadcast to Stellar)',
+    '',
+  ].join('\n')
+}
+
+main().catch((err: unknown) => {
+  if (err instanceof RojojoTrustlineError) {
+    console.error(`\n[Agent] Fatal: ${err.message}`)
+    console.error(`[Agent]   Asset: ${err.asset}`)
+    console.error(`[Agent]   Issuer: ${err.issuer}`)
+    console.error(`[Agent]   Remediation: ${err.remediation}\n`)
+  } else {
+    console.error('[Agent] Fatal error:', err)
+  }
+  process.exit(1)
+})

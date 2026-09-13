@@ -1,0 +1,37 @@
+{
+  "name": "@rojojo/mcp-server",
+  "version": "0.1.0",
+  "description": "MCP server for Rojojo Stellar payments - exposes payment tools to LLM agents",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/winsznx/rojojo.git",
+    "directory": "packages/mcp-server"
+  },
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "rojojo-mcp-server": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --experimental-test-module-mocks --test \"src/**/*.test.ts\"",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "@rojojo/rojojo": "workspace:^",
+    "@stellar/stellar-sdk": "^14.6.1",
+    "@supabase/supabase-js": "^2.47.0",
+    "dotenv": "^17.4.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "tsup": "^8.0.0",
+    "tsx": "^4.22.3",
+    "typescript": "^5.4.5"
+  }
+}
