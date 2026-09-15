@@ -1,8 +1,8 @@
-# Rojojo
+﻿# Rojojo
 
 **Unified payment execution layer for autonomous agents on Stellar**
 
-[![npm](https://img.shields.io/npm/v/@Rojojo/Rojojo)](https://www.npmjs.com/package/@Rojojo/Rojojo) [![CI](https://github.com/winsznx/Rojojo/actions/workflows/ci.yml/badge.svg)](https://github.com/winsznx/Rojojo/actions/workflows/ci.yml) ![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg) ![Network: Stellar](https://img.shields.io/badge/network-Stellar%20testnet%20%2B%20mainnet-brightgreen)
+[![npm](https://img.shields.io/npm/v/@Rojojo/Rojojo)](https://www.npmjs.com/package/@Rojojo/Rojojo) [![CI](https://github.com/oche2920/rojojo/actions/workflows/ci.yml/badge.svg)](https://github.com/oche2920/rojojo/actions/workflows/ci.yml) ![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg) ![Network: Stellar](https://img.shields.io/badge/network-Stellar%20testnet%20%2B%20mainnet-brightgreen)
 
 ---
 
@@ -17,7 +17,7 @@ import { RojojoClient } from '@Rojojo/Rojojo'
 
 const client = new RojojoClient({ wallet, network: 'testnet' })
 const result = await client.pay('https://provider.example.com/price')
-// result.mode → 'x402' | 'mpp-charge' | 'mpp-session' | 'mpp-session-ws' (selected automatically)
+// result.mode â†’ 'x402' | 'mpp-charge' | 'mpp-session' | 'mpp-session-ws' (selected automatically)
 ```
 
 One SDK. One function call. The mode is selected from the provider's `Rojojo.json` manifest. The agent writes nothing else.
@@ -96,7 +96,7 @@ All produced by a single autonomous agent run against two live provider services
 | x402 settlement | `5f603387807faacdc02c71efb74b26091b1be67740f74dfd581d23d643e2db64` | [view](https://stellar.expert/explorer/testnet/tx/5f603387807faacdc02c71efb74b26091b1be67740f74dfd581d23d643e2db64) |
 | Channel open (deploy) | `6ceba32ba2cfd7f3145090c2e6f741db65ae4e4116f3204f2c3173b5266b98ff` | [view](https://stellar.expert/explorer/testnet/tx/6ceba32ba2cfd7f3145090c2e6f741db65ae4e4116f3204f2c3173b5266b98ff) |
 | Channel close (50 vouchers settled) | `234dcbb34cfb7a086f17474f57cacaa9edee8bc8dee873e8f2b851abc0a29a20` | [view](https://stellar.expert/explorer/testnet/tx/234dcbb34cfb7a086f17474f57cacaa9edee8bc8dee873e8f2b851abc0a29a20) |
-| Policy rejection | NO TX — daily cap enforced locally before any broadcast | — |
+| Policy rejection | NO TX â€” daily cap enforced locally before any broadcast | â€” |
 
 **50 interactions. 2 on-chain transactions.** The channel close settled the cumulative amount for all 50 vouchers in a single Soroban invocation.
 
@@ -115,7 +115,7 @@ npm install @Rojojo/Rojojo
 ## Quickstart
 
 ```bash
-git clone https://github.com/winsznx/Rojojo && cd Rojojo
+git clone https://github.com/oche2920/rojojo && cd Rojojo
 pnpm install
 
 pnpm --filter @Rojojo/nulth-sdk build
@@ -133,7 +133,7 @@ Full demo (both providers + agent): see [`docs/AGENT_RUN_CHECKLIST.md`](docs/AGE
 
 Mainnet rollout: see [`docs/MAINNET_DEPLOYMENT.md`](docs/MAINNET_DEPLOYMENT.md).
 
-Redeploying `provider-a`/`provider-b`: read [`docs/PROVIDER_REDEPLOY_ORDERING.md`](docs/PROVIDER_REDEPLOY_ORDERING.md) first — a partial redeploy against the current npm SDK version breaks every live client.
+Redeploying `provider-a`/`provider-b`: read [`docs/PROVIDER_REDEPLOY_ORDERING.md`](docs/PROVIDER_REDEPLOY_ORDERING.md) first â€” a partial redeploy against the current npm SDK version breaks every live client.
 
 ---
 
@@ -155,15 +155,15 @@ pnpm start
 
 ## Three Payment Modes
 
-### x402 — Pay per request
+### x402 â€” Pay per request
 
 Server returns HTTP 402. Agent signs a Soroban auth entry for a USDC SAC transfer. On mainnet, the OpenZeppelin facilitator verifies and broadcasts. On testnet, the provider runs a local facilitator (same x402 V2 protocol). One request, one settlement.
 
-### MPP Charge — Pay per action
+### MPP Charge â€” Pay per action
 
-Agent sends a payment intent via the Stellar MPP charge protocol. USDC transfers natively via the SAC — no facilitator, lower fees. Server verifies and returns the response.
+Agent sends a payment intent via the Stellar MPP charge protocol. USDC transfers natively via the SAC â€” no facilitator, lower fees. Server verifies and returns the response.
 
-### MPP Session — Pay per time
+### MPP Session â€” Pay per time
 
 Agent deposits USDC into a `stellar-experimental/one-way-channel` Soroban contract. For each unit of data consumed, the agent signs an off-chain ed25519 commitment (no RPC call, no transaction fee). The channel settles with one on-chain close transaction for the cumulative amount.
 
@@ -171,9 +171,9 @@ Agent deposits USDC into a `stellar-experimental/one-way-channel` Soroban contra
 
 If a server crashes mid-session, the agent can reclaim deposited funds using the dispute resolution API. Three methods handle the recovery flow:
 
-- **`session.requestRefund()`** — initiates the refund process on the channel contract, starting the refund window (default 17,280 ledgers ≈24h)
-- **`session.settleWithLatestVoucher()`** — server-side counter-mechanism to settle the cumulative amount before the refund window expires, using the highest signed voucher
-- **`session.getDisputeStatus()`** — returns the channel state: `'open'`, `'in-refund-window'`, `'refundable'`, or `'settled'`
+- **`session.requestRefund()`** â€” initiates the refund process on the channel contract, starting the refund window (default 17,280 ledgers â‰ˆ24h)
+- **`session.settleWithLatestVoucher()`** â€” server-side counter-mechanism to settle the cumulative amount before the refund window expires, using the highest signed voucher
+- **`session.getDisputeStatus()`** â€” returns the channel state: `'open'`, `'in-refund-window'`, `'refundable'`, or `'settled'`
 
 Raises: `RojojoDisputeError`, `RojojoChannelStateError`, `RojojoRefundWindowError`
 
@@ -181,17 +181,17 @@ Raises: `RojojoDisputeError`, `RojojoChannelStateError`, `RojojoRefundWindowErro
 
 Deterministic, manifest-driven:
 
-1. Sustained access requested + a session mode available → session
+1. Sustained access requested + a session mode available â†’ session
    (`mpp-session-ws` when the caller asks for a WebSocket transport and the
    provider advertises it, otherwise `mpp-session`)
-2. `mpp-charge` available → charge (lower fees, no facilitator)
-3. `x402` available → x402 (facilitator-backed)
-4. Nothing available → throw
+2. `mpp-charge` available â†’ charge (lower fees, no facilitator)
+3. `x402` available â†’ x402 (facilitator-backed)
+4. Nothing available â†’ throw
 
-### `mpp-session-ws` — WebSocket streaming sessions
+### `mpp-session-ws` â€” WebSocket streaming sessions
 
 Open a channel, negotiate the voucher, then upgrade the HTTP connection to
-WebSocket — the transport OpenAI/Anthropic/Google-style inference providers
+WebSocket â€” the transport OpenAI/Anthropic/Google-style inference providers
 speak natively, without an SSE wrapper:
 
 ```ts
@@ -228,7 +228,7 @@ Every provider serves `/.well-known/Rojojo.json`. The SDK fetches and validates 
 }
 ```
 
-The Supabase `providers` table indexes manifests with `pg_trgm` trigram search — agents query by capability, not by URL.
+The Supabase `providers` table indexes manifests with `pg_trgm` trigram search â€” agents query by capability, not by URL.
 
 ---
 
@@ -296,10 +296,10 @@ await request(app).get('/price').expect(200)
 expect(onSettled).toHaveBeenCalledWith(expect.any(String), '0.001', 'x402')
 ```
 
-- `payment: 'auto-pass'` (default) invokes the callbacks with synthetic data, then runs your route handler. `'auto-fail'` responds `402` and skips both — exactly like a rejected payment.
-- `mode: 'mpp-session'` drives the full `onSessionOpen → onVoucher* → onSettled` sequence.
+- `payment: 'auto-pass'` (default) invokes the callbacks with synthetic data, then runs your route handler. `'auto-fail'` responds `402` and skips both â€” exactly like a rejected payment.
+- `mode: 'mpp-session'` drives the full `onSessionOpen â†’ onVoucher* â†’ onSettled` sequence.
 - Override synthetic values via `synthetic: { txHash, amount, channelId, rate, voucherCount }`.
-- To test a callback with no HTTP server at all, call `runMockSettlement(opts)` directly — it returns the synthetic settlement record.
+- To test a callback with no HTTP server at all, call `runMockSettlement(opts)` directly â€” it returns the synthetic settlement record.
 
 ---
 
@@ -307,14 +307,14 @@ expect(onSettled).toHaveBeenCalledWith(expect.any(String), '0.001', 'x402')
 
 ```
 Rojojo/
-├── packages/sdk/            # @Rojojo/Rojojo — npm
-├── packages/mcp-server/     # @Rojojo/mcp-server — MCP server for LLM agents
-├── apps/web/                # Next.js 16 dashboard + landing — Cloudflare Workers
-├── apps/provider-a/         # Cloudflare Worker price endpoint (x402 + MPP charge)
-├── apps/provider-b/         # Cloudflare Worker orderbook endpoint (MPP session)
-├── contracts/agent-vault/   # Soroban contract account — Stellar
-├── agent/                   # Reference autonomous agent
-└── supabase/                # Schema + RLS + trigram indexes + Realtime
+â”œâ”€â”€ packages/sdk/            # @Rojojo/Rojojo â€” npm
+â”œâ”€â”€ packages/mcp-server/     # @Rojojo/mcp-server â€” MCP server for LLM agents
+â”œâ”€â”€ apps/web/                # Next.js 16 dashboard + landing â€” Cloudflare Workers
+â”œâ”€â”€ apps/provider-a/         # Cloudflare Worker price endpoint (x402 + MPP charge)
+â”œâ”€â”€ apps/provider-b/         # Cloudflare Worker orderbook endpoint (MPP session)
+â”œâ”€â”€ contracts/agent-vault/   # Soroban contract account â€” Stellar
+â”œâ”€â”€ agent/                   # Reference autonomous agent
+â””â”€â”€ supabase/                # Schema + RLS + trigram indexes + Realtime
 ```
 
 ---
@@ -323,17 +323,17 @@ Rojojo/
 
 | Capability | Detail |
 |---|---|
-| x402 settlement (testnet) | Local `ExactStellarFacilitatorScheme` — no third-party dependency |
+| x402 settlement (testnet) | Local `ExactStellarFacilitatorScheme` â€” no third-party dependency |
 | x402 settlement (mainnet) | OZ hosted facilitator at `channels.openzeppelin.com/x402` with Bearer auth |
 | MPP charge settlement | Server-side broadcast via `@stellar/mpp` pull mode |
-| MPP session: off-chain vouchers | 50 vouchers verified — each signed as ed25519 commitment, no on-chain tx per voucher |
+| MPP session: off-chain vouchers | 50 vouchers verified â€” each signed as ed25519 commitment, no on-chain tx per voucher |
 | MPP session: on-chain close | Single Soroban `close(amount, signature)` settles the cumulative amount |
 | Contract account policy enforcement | `__check_auth` daily cap rejects overspend at the Soroban level |
 | Dashboard Realtime | Supabase `postgres_changes` subscriptions on `sessions` and `tx_log` |
 | Discovery registry | `providers` table with `pg_trgm` trigram indexes for fuzzy capability search |
 | npm package | [`@Rojojo/Rojojo@0.1.0`](https://www.npmjs.com/package/@Rojojo/Rojojo) |
-| MCP server | [`@Rojojo/mcp-server`](packages/mcp-server) — LLM agent integration via Model Context Protocol |
-| Network support | `STELLAR_NETWORK=testnet|mainnet` — single env var switches all code paths |
+| MCP server | [`@Rojojo/mcp-server`](packages/mcp-server) â€” LLM agent integration via Model Context Protocol |
+| Network support | `STELLAR_NETWORK=testnet|mainnet` â€” single env var switches all code paths |
 
 ---
 
@@ -352,15 +352,15 @@ Rojojo/
 
 ## Full Technical Brief
 
-For a detailed walkthrough of the architecture, protocol conformance, security model, and design decisions, see the [Submission Brief](https://github.com/winsznx/Rojojo/blob/main/docs/SUBMISSION_ONEPAGER.md).
+For a detailed walkthrough of the architecture, protocol conformance, security model, and design decisions, see the [Submission Brief](https://github.com/oche2920/rojojo/blob/main/docs/SUBMISSION_ONEPAGER.md).
 
 ---
 
 ## What's next
 
-Rojojo is a **chain-agnostic agent payment protocol with Stellar as its canonical home.** The protocols it unifies aren't Stellar-bound — x402, which Rojojo wraps, was designed multi-chain and already settles on EVM.
+Rojojo is a **chain-agnostic agent payment protocol with Stellar as its canonical home.** The protocols it unifies aren't Stellar-bound â€” x402, which Rojojo wraps, was designed multi-chain and already settles on EVM.
 
-The [**Multi-Chain Roadmap**](docs/MULTICHAIN_ROADMAP.md) sketches a `ChainAdapter` interface with the existing Stellar clients as the reference implementation and **EVM (via x402) as the first extension target** — keeping the single-call agent experience (`client.pay(url)`) identical across chains. The plan is additive: the manifest's `chain` field is optional and defaults to `stellar`, so every existing provider and agent keeps working.
+The [**Multi-Chain Roadmap**](docs/MULTICHAIN_ROADMAP.md) sketches a `ChainAdapter` interface with the existing Stellar clients as the reference implementation and **EVM (via x402) as the first extension target** â€” keeping the single-call agent experience (`client.pay(url)`) identical across chains. The plan is additive: the manifest's `chain` field is optional and defaults to `stellar`, so every existing provider and agent keeps working.
 
 ---
 
